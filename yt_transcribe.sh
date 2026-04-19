@@ -35,9 +35,8 @@ _vtt_to_txt() {
     local vtt_in="$1"
     local txt_out="$2"
 
-    python3 - "$vtt_in" "$txt_out" << 'PYEOF'
-import re
-import sys
+    python3 - "$vtt_in" "$txt_out" << 'INNEREOF'
+import re, sys
 
 vtt_path = sys.argv[1]
 txt_path = sys.argv[2]
@@ -46,40 +45,93 @@ with open(vtt_path, "r", encoding="utf-8") as f:
     raw = f.read()
 
 # Remove WEBVTT header block
-raw = re.sub(r'^WEBVTT.*?\n\n', '', raw, flags=re.DOTALL)
+raw = re.sub(r"^WEBVTT[^\n]*\n.*?\n\n", "", raw, count=1, flags=re.DOTALL)
 
-# Remove timestamp lines (00:00:00.000 --> 00:00:00.000 ...)
-raw = re.sub(r'\d{2}:\d{2}[\d:,.]+\s*-->\s*\d{2}:\d{2}[\d:,.]+[^\n]*\n', '', raw)
+# Split into cue blocks on double newlines — blank lines are paragraph signals
+blocks = re.split(r"\n{2,}", raw)
 
-# Remove cue identifiers (lines that are just numbers or NOTE lines)
-raw = re.sub(r'^\s*\d+\s*$', '', raw, flags=re.MULTILINE)
-raw = re.sub(r'^NOTE.*$', '', raw, flags=re.MULTILINE)
+sentences     = []
+para_breaks   = set()
+prev_line     = None
+prev_sent_end = False
 
-# Remove HTML/VTT tags (<c>, <b>, timestamps like <00:00:00.000>)
-raw = re.sub(r'<[^>]+>', '', raw)
+for block in blocks:
+    if not block.strip():
+        continue
+    lines = block.strip().splitlines()
 
-# Remove lines with only whitespace
-lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    # Strip cue ID (pure digits)
+    if lines and re.match(r"^\s*\d+\s*$", lines[0]):
+        lines = lines[1:]
+    # Strip timestamp line
+    if lines and re.match(r"\d{2}:\d{2}[\d:,.]+\s*-->\s*\d{2}:\d{2}", lines[0]):
+        lines = lines[1:]
+    # Skip NOTE blocks
+    if lines and lines[0].startswith("NOTE"):
+        continue
 
-# Deduplicate consecutive identical lines (YouTube auto-subs repeat lines)
-deduped = []
-prev = None
-for line in lines:
-    if line != prev:
-        deduped.append(line)
-    prev = line
+    # Clean VTT/HTML tags and entities
+    cleaned = []
+    for line in lines:
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"&amp;", "&", line)
+        line = re.sub(r"&lt;",  "<", line)
+        line = re.sub(r"&gt;",  ">", line)
+        line = line.strip()
+        if line:
+            cleaned.append(line)
 
-# Join into paragraphs — blank line between every 5 sentences
-output = " ".join(deduped)
-# Normalize multiple spaces
-output = re.sub(r' +', ' ', output).strip()
+    if not cleaned:
+        continue
+
+    for line in cleaned:
+        if line == prev_line:
+            continue
+        sentences.append(line)
+        # Record paragraph break at this sentence if the PREVIOUS
+        # sentence ended the cue with sentence-final punctuation
+        if prev_sent_end:
+            para_breaks.add(len(sentences) - 1)
+        prev_line     = line
+        prev_sent_end = bool(re.search(r"[.!?]\s*$", line))
+
+# Merge continuation fragments (same cue, no sentence-final punct, lowercase next)
+merged = []
+for i, sent in enumerate(sentences):
+    if (merged
+            and not re.search(r"[.!?,;:]\s*$", merged[-1])
+            and i not in para_breaks
+            and sent[:1].islower()):
+        merged[-1] = merged[-1].rstrip() + " " + sent
+    else:
+        merged.append(sent)
+
+# Build paragraphs — break when VTT had a blank-line boundary AND
+# current sentence ends with .!? AND next sentence starts with capital
+paragraphs = []
+current    = []
+
+for i, sent in enumerate(merged):
+    current.append(sent)
+    is_sent_end    = bool(re.search(r"[.!?]\s*$", sent))
+    next_is_cap    = (i + 1 < len(merged) and merged[i + 1][:1].isupper())
+    has_vtt_break  = (i + 1) in para_breaks
+
+    if is_sent_end and next_is_cap and has_vtt_break:
+        paragraphs.append(" ".join(current))
+        current = []
+
+if current:
+    paragraphs.append(" ".join(current))
+
+output = "\n\n".join(paragraphs)
+output = re.sub(r" +", " ", output).strip()
 
 with open(txt_path, "w", encoding="utf-8") as f:
-    f.write(output)
-    f.write("\n")
+    f.write(output + "\n")
 
-print(f"Converted {len(deduped)} lines → {txt_path}")
-PYEOF
+print(f"Converted {len(merged)} lines → {len(paragraphs)} paragraphs → {txt_path}")
+'INNEREOF'
 }
 
 # Export function so it's available in the script scope
@@ -430,7 +482,9 @@ ${TRANSCRIPT_TEXT}"
         echo ""
         echo "---"
         echo ""
-        echo "$RESPONSE" | jq -r '.response'
+        echo "$RESPONSE" | jq -r '.response' \
+            | perl -0pe 's|<think>.*?</think>||gs' \
+            | sed '/^[[:space:]]*$/{ N; /^\n[[:space:]]*$/d }'
     } > "$SUMMARY_FILE"
 
     echo "==> Summary     : ${SUMMARY_FILE}"

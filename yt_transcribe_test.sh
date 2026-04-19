@@ -163,10 +163,11 @@ for test_case in "${TEST_CASES[@]}"; do
     # Build args array
     read -ra ARGS <<< "$EXTRA_ARGS"
 
-    # Run with OUTPUT_BASE overridden via sed-patched script
+    # Run with OUTPUT_BASE overridden via environment variable — avoids
+    # corrupting heredocs in yt_transcribe.sh by piping through sed
     set +e
-    sed "s|OUTPUT_BASE=\"\${OUTPUT_BASE:-\${HOME}/Downloads}\"|OUTPUT_BASE=\"${TEMP_OUTPUT_ROOT}\"|" \
-        "$TRANSCRIBE_SCRIPT" | bash -s -- "$TEST_URL" "${ARGS[@]}" \
+    OUTPUT_BASE="$TEMP_OUTPUT_ROOT" \
+        "$TRANSCRIBE_SCRIPT" "$TEST_URL" "${ARGS[@]}" \
         2>&1 | sed "s/^/    [${CASE_DIR}] /" | tee -a "$REPORT_FILE"
     EXIT_CODE=${PIPESTATUS[0]}
     set -e

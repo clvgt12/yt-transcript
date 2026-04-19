@@ -15,12 +15,13 @@
 #   - whisper       (pip:  openai-whisper, inside venv at ~/venvs/openai-whisper)
 #
 # Output:
-#   Audio and transcript files are written to ~/yt_transcribe/<video_id>/
+#   Audio and transcript files are written to ~/Downloads/<video_id>/
 #
 # Notes:
 #   - Whisper model weights are cached in ~/.cache/whisper/ on first use
 #   - GPU (CUDA) acceleration is used automatically if available
 #   - PyTorch 2.2.0+cu118 with numpy<2 required for GTX 1050 Ti (Pascal/sm_61)
+#   - Download is skipped if an MP3 already exists in the output directory
 #
 # Change history:
 #   See git log for revision history
@@ -93,34 +94,39 @@ SAFE_TITLE=$(echo "$VIDEO_TITLE" | tr -cd '[:alnum:] _-' | tr ' ' '_' | cut -c1-
 OUTPUT_DIR="${OUTPUT_BASE}/${VIDEO_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-AUDIO_FILE="${OUTPUT_DIR}/${SAFE_TITLE}.mp3"
-
 echo "==> Video ID    : ${VIDEO_ID}"
 echo "==> Title       : ${VIDEO_TITLE}"
 echo "==> Output dir  : ${OUTPUT_DIR}"
 echo "==> Whisper model: ${WHISPER_MODEL}"
 
-# ─── Download audio ───────────────────────────────────────────────────────────
+# ─── Download audio (skip if MP3 already exists) ─────────────────────────────
 
 echo ""
-echo "==> Downloading audio..."
+EXISTING_MP3=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
 
-"$YT_DLP_BIN" \
-    --extract-audio \
-    --audio-format mp3 \
-    --audio-quality 0 \
-    --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
-    "$YT_URL"
+if [[ -n "$EXISTING_MP3" ]]; then
+    echo "==> Audio already exists, skipping download."
+    echo "==> Audio found : ${EXISTING_MP3}"
+    AUDIO_FILE="$EXISTING_MP3"
+else
+    echo "==> Downloading audio..."
 
-# Locate the downloaded MP3 (title may differ slightly from our sanitized name)
-AUDIO_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
+    "$YT_DLP_BIN" \
+        --extract-audio \
+        --audio-format mp3 \
+        --audio-quality 0 \
+        --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
+        "$YT_URL"
 
-if [[ -z "$AUDIO_FILE" ]]; then
-    echo "Error: Audio download failed — no MP3 found in ${OUTPUT_DIR}" >&2
-    exit 1
+    AUDIO_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
+
+    if [[ -z "$AUDIO_FILE" ]]; then
+        echo "Error: Audio download failed — no MP3 found in ${OUTPUT_DIR}" >&2
+        exit 1
+    fi
+
+    echo "==> Audio saved : ${AUDIO_FILE}"
 fi
-
-echo "==> Audio saved : ${AUDIO_FILE}"
 
 # ─── Transcribe with Whisper ──────────────────────────────────────────────────
 

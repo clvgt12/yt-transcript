@@ -1,70 +1,109 @@
 #!/usr/bin/env bash
 # yt_transcribe.sh — Download YouTube audio, transcribe with Whisper, optionally summarize with Ollama
+# Container-aware version: respects YT_DLP_BIN, OUTPUT_BASE, OLLAMA_URL env vars
 #
 # Usage:
 #   ./yt_transcribe.sh <YouTube_URL> [options]
 #
-# Arguments:
-#   YouTube_URL              Full YouTube video URL (required)
-#
 # Options:
-#   --whisper=MODEL          Whisper model: tiny, base, small, medium, large
-#                            (default: base)
-#   --summarize[=MODEL]      Enable Ollama summarization. Optionally specify
-#                            the Ollama model name (default: gemma3:1b)
-#   -h, --help               Show this help message and exit
+#   --whisper=MODEL          Whisper model: tiny, base, small, medium, large (default: small)
+#   --summarize[=MODEL]      Enable Ollama summarization, optionally specify model (default: gemma3:1b)
+#   --force-whisper          Skip subtitle check, always use Whisper for transcription
+#   -h, --help               Show this help and exit
 #
-# Dependencies:
-#   - yt-dlp        (snap: yt-dlp)
-#   - ffmpeg        (apt:  ffmpeg)
-#   - whisper       (pip:  openai-whisper, inside venv at ~/venvs/openai-whisper)
-#   - docker        (apt:  docker.io or docker-ce)  [required only with --summarize]
-#   - jq            (apt:  jq)                      [required only with --summarize]
+# Transcription strategy (in order of preference):
+#   1. Human-written YouTube subtitles  (fastest, highest quality when available)
+#   2. Auto-generated YouTube subtitles (fast, variable quality)
+#   3. Whisper local inference          (slowest, most reliable fallback)
 #
-# Output (written to ~/Downloads/<video_id>/):
-#   <title>.mp3     Downloaded audio
-#   <title>.txt     Whisper transcript
-#   <title>.md      Ollama summary in markdown (only with --summarize)
-#
-# Notes:
-#   - Whisper model weights are cached in ~/.cache/whisper/ on first use
-#   - GPU (CUDA) acceleration is used automatically if available
-#   - tiny/base/small models run on GPU; medium/large run on CPU (GTX 1050 Ti
-#     has insufficient VRAM for larger models alongside the KDE desktop stack)
-#   - PyTorch 2.2.0+cu118 with numpy<2 required for GTX 1050 Ti (Pascal/sm_61)
-#   - Download is skipped if an MP3 already exists in the output directory
-#   - Ollama runs in a temporary container on port 11435, removed after use
-#   - Ollama model weights are reused from the existing 'ollama' Docker volume
-#
-# Examples:
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX"
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --whisper=medium
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --summarize
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --summarize=qwen3:1.7b
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --whisper=small --summarize=gemma3:1b
+# Environment variables (set by Docker Compose):
+#   YT_DLP_BIN               Path to yt-dlp binary (default: /usr/local/bin/yt-dlp)
+#   OUTPUT_BASE              Output root directory (default: /outputs)
+#   VENV_PATH                Python venv path (default: /venv)
+#   OLLAMA_URL               Ollama API base URL (default: http://ollama:11434)
+#   OLLAMA_HOST_PORT         Ollama container port (default: 11434)
 #
 # Change history:
 #   See git log for revision history
 
 set -euo pipefail
 
+# ─── VTT to plain text converter ─────────────────────────────────────────────
+# Defined as a function — strips WebVTT headers, timestamps, and duplicate lines
+
+_vtt_to_txt() {
+    local vtt_in="$1"
+    local txt_out="$2"
+
+    python3 - "$vtt_in" "$txt_out" << 'PYEOF'
+import re
+import sys
+
+vtt_path = sys.argv[1]
+txt_path = sys.argv[2]
+
+with open(vtt_path, "r", encoding="utf-8") as f:
+    raw = f.read()
+
+# Remove WEBVTT header block
+raw = re.sub(r'^WEBVTT.*?\n\n', '', raw, flags=re.DOTALL)
+
+# Remove timestamp lines (00:00:00.000 --> 00:00:00.000 ...)
+raw = re.sub(r'\d{2}:\d{2}[\d:,.]+\s*-->\s*\d{2}:\d{2}[\d:,.]+[^\n]*\n', '', raw)
+
+# Remove cue identifiers (lines that are just numbers or NOTE lines)
+raw = re.sub(r'^\s*\d+\s*$', '', raw, flags=re.MULTILINE)
+raw = re.sub(r'^NOTE.*$', '', raw, flags=re.MULTILINE)
+
+# Remove HTML/VTT tags (<c>, <b>, timestamps like <00:00:00.000>)
+raw = re.sub(r'<[^>]+>', '', raw)
+
+# Remove lines with only whitespace
+lines = [l.strip() for l in raw.splitlines() if l.strip()]
+
+# Deduplicate consecutive identical lines (YouTube auto-subs repeat lines)
+deduped = []
+prev = None
+for line in lines:
+    if line != prev:
+        deduped.append(line)
+    prev = line
+
+# Join into paragraphs — blank line between every 5 sentences
+output = " ".join(deduped)
+# Normalize multiple spaces
+output = re.sub(r' +', ' ', output).strip()
+
+with open(txt_path, "w", encoding="utf-8") as f:
+    f.write(output)
+    f.write("\n")
+
+print(f"Converted {len(deduped)} lines → {txt_path}")
+PYEOF
+}
+
+# Export function so it's available in the script scope
+export -f _vtt_to_txt 2>/dev/null || true
+
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-VENV_PATH="${HOME}/venvs/openai-whisper"
-OUTPUT_BASE="${HOME}/Downloads"
+VENV_PATH="${VENV_PATH:-/venv}"
+OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads}"
 DEFAULT_WHISPER_MODEL="small"
 DEFAULT_OLLAMA_MODEL="gemma3:1b"
-YT_DLP_BIN="/snap/bin/yt-dlp"
+YT_DLP_BIN="${YT_DLP_BIN:-/snap/bin/yt-dlp}"
+
+# Ollama settings
+OLLAMA_IMAGE="ollama/ollama"
+OLLAMA_CONTAINER="yt-transcribe-ollama-$$"
+OLLAMA_HOST_PORT="${OLLAMA_HOST_PORT:-11435}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:${OLLAMA_HOST_PORT}}"
+OLLAMA_EXTERNAL="${OLLAMA_URL:-}"
+OLLAMA_VOLUME="ollama"
 
 # Models that fit in VRAM alongside the KDE desktop stack (~1.5 GB overhead)
 GPU_MODELS="tiny base small"
-
-# Ollama container settings
-OLLAMA_IMAGE="ollama/ollama"
-OLLAMA_CONTAINER="yt-transcribe-ollama-$$"   # $$ = PID, ensures uniqueness
-OLLAMA_HOST_PORT="11435"                       # Dedicated port, avoids conflict with existing Ollama
-OLLAMA_VOLUME="ollama"                         # Reuse existing ollama Docker volume
-OLLAMA_URL="http://localhost:${OLLAMA_HOST_PORT}"
 
 # ─── Argument handling ────────────────────────────────────────────────────────
 
@@ -77,22 +116,15 @@ YT_URL=""
 WHISPER_MODEL="$DEFAULT_WHISPER_MODEL"
 OLLAMA_MODEL="$DEFAULT_OLLAMA_MODEL"
 SUMMARIZE=false
+FORCE_WHISPER=false
 
 for arg in "$@"; do
     case "$arg" in
-        --whisper=*)
-            WHISPER_MODEL="${arg#--whisper=}"
-            ;;
-        --summarize=*)
-            SUMMARIZE=true
-            OLLAMA_MODEL="${arg#--summarize=}"
-            ;;
-        --summarize)
-            SUMMARIZE=true
-            ;;
-        --help|-h)
-            usage
-            ;;
+        --whisper=*)     WHISPER_MODEL="${arg#--whisper=}" ;;
+        --summarize=*)   SUMMARIZE=true; OLLAMA_MODEL="${arg#--summarize=}" ;;
+        --summarize)     SUMMARIZE=true ;;
+        --force-whisper) FORCE_WHISPER=true ;;
+        --help|-h)       usage ;;
         --*)
             echo "Error: Unknown option '${arg}'" >&2
             echo "       Run with --help for usage." >&2
@@ -103,7 +135,6 @@ for arg in "$@"; do
                 YT_URL="$arg"
             else
                 echo "Error: Unexpected argument '${arg}'" >&2
-                echo "       Run with --help for usage." >&2
                 exit 1
             fi
             ;;
@@ -112,18 +143,15 @@ done
 
 if [[ -z "$YT_URL" ]]; then
     echo "Error: YouTube URL is required." >&2
-    echo "       Run with --help for usage." >&2
     exit 1
 fi
 
-# Validate Whisper model name
 VALID_MODELS="tiny base small medium large"
 if ! echo "$VALID_MODELS" | grep -qw "$WHISPER_MODEL"; then
     echo "Error: Invalid Whisper model '${WHISPER_MODEL}'. Choose from: ${VALID_MODELS}" >&2
     exit 1
 fi
 
-# Select Whisper compute device based on model size
 if echo "$GPU_MODELS" | grep -qw "$WHISPER_MODEL"; then
     WHISPER_DEVICE="cuda"
 else
@@ -133,38 +161,38 @@ fi
 # ─── Dependency checks ────────────────────────────────────────────────────────
 
 check_dep() {
-    local bin="$1"
-    local hint="$2"
+    local bin="$1" hint="$2"
     if ! command -v "$bin" &>/dev/null && [[ ! -x "$bin" ]]; then
         echo "Error: '${bin}' not found. ${hint}" >&2
         exit 1
     fi
 }
 
-check_dep "$YT_DLP_BIN"  "Install with: sudo snap install yt-dlp"
-check_dep "ffmpeg"        "Install with: sudo apt install ffmpeg"
+check_dep "$YT_DLP_BIN" "Install with: sudo snap install yt-dlp"
+check_dep "ffmpeg"       "Install with: sudo apt install ffmpeg"
 
 if [[ "$SUMMARIZE" == "true" ]]; then
-    check_dep "docker"   "Install with: sudo apt install docker.io"
-    check_dep "curl"     "Install with: sudo apt install curl"
-    check_dep "jq"       "Install with: sudo apt install jq"
+    check_dep "curl" "Install with: sudo apt install curl"
+    check_dep "jq"   "Install with: sudo apt install jq"
 fi
 
-if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
-    echo "Error: Whisper venv not found at ${VENV_PATH}" >&2
-    echo "       Create it with: python3 -m venv ${VENV_PATH}" >&2
-    echo "       Then: source ${VENV_PATH}/bin/activate && pip install -r ${VENV_PATH}/requirements.txt" >&2
-    exit 1
+# Whisper venv only required if we may fall back to it
+if [[ "$FORCE_WHISPER" == "true" ]] || [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
+    if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
+        echo "Error: Python venv not found at ${VENV_PATH}" >&2
+        echo "       Create it: python3 -m venv ${VENV_PATH}" >&2
+        exit 1
+    fi
 fi
 
-# ─── Cleanup trap — always remove Ollama container on exit ───────────────────
+# ─── Cleanup trap ─────────────────────────────────────────────────────────────
 
 OLLAMA_STARTED=false
 
 cleanup() {
     if [[ "$OLLAMA_STARTED" == "true" ]]; then
         echo ""
-        echo "==> Stopping and removing Ollama container (${OLLAMA_CONTAINER})..."
+        echo "==> Stopping Ollama container (${OLLAMA_CONTAINER})..."
         docker stop "$OLLAMA_CONTAINER" &>/dev/null || true
         docker rm   "$OLLAMA_CONTAINER" &>/dev/null || true
         echo "==> Ollama container removed."
@@ -172,17 +200,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ─── Resolve video ID for output directory naming ─────────────────────────────
+# ─── Resolve video metadata ───────────────────────────────────────────────────
 
 echo "==> Resolving video metadata..."
 VIDEO_ID=$("$YT_DLP_BIN" --print id "$YT_URL" 2>/dev/null) || {
     echo "Error: Could not resolve video ID. Check the URL or yt-dlp version." >&2
     exit 1
 }
-
 VIDEO_TITLE=$("$YT_DLP_BIN" --print title "$YT_URL" 2>/dev/null || echo "unknown_title")
-
-# Sanitize title for filesystem use
 SAFE_TITLE=$(echo "$VIDEO_TITLE" | tr -cd '[:alnum:] _-' | tr ' ' '_' | cut -c1-60)
 
 OUTPUT_DIR="${OUTPUT_BASE}/${VIDEO_ID}"
@@ -192,6 +217,7 @@ echo "==> Video ID      : ${VIDEO_ID}"
 echo "==> Title         : ${VIDEO_TITLE}"
 echo "==> Output dir    : ${OUTPUT_DIR}"
 echo "==> Whisper model : ${WHISPER_MODEL} (${WHISPER_DEVICE})"
+echo "==> Force Whisper : ${FORCE_WHISPER}"
 if [[ "$SUMMARIZE" == "true" ]]; then
     echo "==> Summarize     : yes (${OLLAMA_MODEL})"
 else
@@ -208,11 +234,9 @@ EXISTING_MP3=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
 
 if [[ -n "$EXISTING_MP3" ]]; then
     echo "==> Audio already exists, skipping download."
-    echo "==> Audio found : ${EXISTING_MP3}"
     AUDIO_FILE="$EXISTING_MP3"
 else
     echo "==> Downloading audio..."
-
     "$YT_DLP_BIN" \
         --extract-audio \
         --audio-format mp3 \
@@ -221,40 +245,97 @@ else
         "$YT_URL"
 
     AUDIO_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
-
     if [[ -z "$AUDIO_FILE" ]]; then
         echo "Error: Audio download failed — no MP3 found in ${OUTPUT_DIR}" >&2
         exit 1
     fi
-
     echo "==> Audio saved : ${AUDIO_FILE}"
 fi
 
-# ─── Transcribe with Whisper ──────────────────────────────────────────────────
+# ─── Transcription — subtitle fast path, Whisper fallback ────────────────────
 
 echo ""
-echo "==> Activating Whisper venv..."
-# shellcheck disable=SC1091
-source "${VENV_PATH}/bin/activate"
+TRANSCRIPT_FILE=""
+TRANSCRIPT_SOURCE=""
 
-echo "==> Transcribing with model '${WHISPER_MODEL}' on ${WHISPER_DEVICE}..."
-whisper "$AUDIO_FILE" \
-    --model "$WHISPER_MODEL" \
-    --device "$WHISPER_DEVICE" \
-    --output_dir "$OUTPUT_DIR" \
-    --output_format txt \
-    --verbose False
+# Check for existing transcript first (any previous run)
+EXISTING_TXT=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.txt" | head -1)
+if [[ -n "$EXISTING_TXT" ]]; then
+    echo "==> Transcript already exists, skipping transcription."
+    TRANSCRIPT_FILE="$EXISTING_TXT"
+    TRANSCRIPT_SOURCE="cached"
 
-deactivate
+elif [[ "$FORCE_WHISPER" == "false" ]]; then
 
-TRANSCRIPT_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.txt" | head -1)
+    # ── Attempt 1: human-written subtitles ───────────────────────────────────
+    echo "==> Checking for human-written subtitles..."
+    "$YT_DLP_BIN" \
+        --skip-download \
+        --write-subs \
+        --sub-lang en \
+        --sub-format vtt \
+        --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
+        "$YT_URL" 2>/dev/null || true
+
+    VTT_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.en.vtt" ! -name "*.live_chat*" | head -1)
+
+    if [[ -n "$VTT_FILE" ]]; then
+        echo "==> Human subtitles found: ${VTT_FILE}"
+        TRANSCRIPT_FILE="${OUTPUT_DIR}/${SAFE_TITLE}.txt"
+        _vtt_to_txt "$VTT_FILE" "$TRANSCRIPT_FILE"
+        TRANSCRIPT_SOURCE="youtube-subtitles"
+
+    else
+        # ── Attempt 2: auto-generated subtitles ──────────────────────────────
+        echo "==> No human subtitles. Checking for auto-generated subtitles..."
+        "$YT_DLP_BIN" \
+            --skip-download \
+            --write-auto-subs \
+            --sub-lang en \
+            --sub-format vtt \
+            --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
+            "$YT_URL" 2>/dev/null || true
+
+        VTT_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.en.vtt" ! -name "*.live_chat*" | head -1)
+
+        if [[ -n "$VTT_FILE" ]]; then
+            echo "==> Auto-generated subtitles found: ${VTT_FILE}"
+            TRANSCRIPT_FILE="${OUTPUT_DIR}/${SAFE_TITLE}.txt"
+            _vtt_to_txt "$VTT_FILE" "$TRANSCRIPT_FILE"
+            TRANSCRIPT_SOURCE="youtube-auto-subtitles"
+        fi
+    fi
+fi
+
+# ── Attempt 3: Whisper local inference (fallback or --force-whisper) ─────────
+if [[ -z "$TRANSCRIPT_FILE" ]]; then
+    if [[ "$FORCE_WHISPER" == "true" ]]; then
+        echo "==> --force-whisper set — using Whisper for transcription."
+    else
+        echo "==> No YouTube subtitles available — falling back to Whisper."
+    fi
+
+    source "${VENV_PATH}/bin/activate"
+    echo "==> Transcribing with Whisper '${WHISPER_MODEL}' on ${WHISPER_DEVICE}..."
+    whisper "$AUDIO_FILE" \
+        --model "$WHISPER_MODEL" \
+        --device "$WHISPER_DEVICE" \
+        --output_dir "$OUTPUT_DIR" \
+        --output_format txt \
+        --verbose False
+    deactivate
+
+    TRANSCRIPT_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.txt" | head -1)
+    TRANSCRIPT_SOURCE="whisper-${WHISPER_MODEL}"
+fi
 
 if [[ -z "$TRANSCRIPT_FILE" ]]; then
-    echo "Error: Transcription failed — no .txt file found in ${OUTPUT_DIR}" >&2
+    echo "Error: All transcription methods failed." >&2
     exit 1
 fi
 
 echo "==> Transcript  : ${TRANSCRIPT_FILE}"
+echo "==> Source      : ${TRANSCRIPT_SOURCE}"
 
 # ─── Summarize with Ollama (optional) ────────────────────────────────────────
 
@@ -262,42 +343,44 @@ SUMMARY_FILE=""
 
 if [[ "$SUMMARIZE" == "true" ]]; then
 
-    echo ""
-    echo "==> Starting Ollama container (${OLLAMA_CONTAINER}) on port ${OLLAMA_HOST_PORT}..."
+    if [[ -n "$OLLAMA_EXTERNAL" && "$OLLAMA_EXTERNAL" != "http://localhost:"* ]]; then
+        echo ""
+        echo "==> Using external Ollama service at ${OLLAMA_URL}"
+        READY=false
+        for i in $(seq 1 30); do
+            if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
+                READY=true; break
+            fi
+            sleep 1
+        done
+        [[ "$READY" != "true" ]] && { echo "Error: Ollama not reachable at ${OLLAMA_URL}" >&2; exit 1; }
+    else
+        echo ""
+        echo "==> Starting local Ollama container (${OLLAMA_CONTAINER})..."
+        docker volume create "$OLLAMA_VOLUME" &>/dev/null || true
+        docker run -d \
+            --name "$OLLAMA_CONTAINER" \
+            --gpus all \
+            -p "${OLLAMA_HOST_PORT}:11434" \
+            -v "${OLLAMA_VOLUME}:/root/.ollama" \
+            "$OLLAMA_IMAGE" &>/dev/null
+        OLLAMA_STARTED=true
 
-    docker run -d \
-        --name "$OLLAMA_CONTAINER" \
-        --gpus all \
-        -p "${OLLAMA_HOST_PORT}:11434" \
-        -v "${OLLAMA_VOLUME}:/root/.ollama" \
-        "$OLLAMA_IMAGE" &>/dev/null
-
-    OLLAMA_STARTED=true
-
-    # Wait for Ollama API to become ready (up to 30 seconds)
-    echo "==> Waiting for Ollama API to be ready..."
-    READY=false
-    for i in $(seq 1 30); do
-        if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
-            READY=true
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ "$READY" != "true" ]]; then
-        echo "Error: Ollama API did not become ready within 30 seconds." >&2
-        exit 1
+        echo "==> Waiting for Ollama API..."
+        READY=false
+        for i in $(seq 1 30); do
+            if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
+                READY=true; break
+            fi
+            sleep 1
+        done
+        [[ "$READY" != "true" ]] && { echo "Error: Ollama did not become ready." >&2; exit 1; }
     fi
 
-    echo "==> Ollama ready."
-
-    # Pull model if not already cached in the volume
-    echo "==> Checking for model '${OLLAMA_MODEL}'..."
+    echo "==> Ollama ready. Checking model '${OLLAMA_MODEL}'..."
     MODEL_EXISTS=$(curl -sf "${OLLAMA_URL}/api/tags" | grep -c "\"${OLLAMA_MODEL}\"" || true)
-
     if [[ "$MODEL_EXISTS" -eq 0 ]]; then
-        echo "==> Pulling model '${OLLAMA_MODEL}' (first use — cached to Docker volume)..."
+        echo "==> Pulling '${OLLAMA_MODEL}'..."
         curl -sf -X POST "${OLLAMA_URL}/api/pull" \
             -H "Content-Type: application/json" \
             -d "{\"name\": \"${OLLAMA_MODEL}\"}" | grep -v '^$' | tail -1
@@ -306,9 +389,7 @@ if [[ "$SUMMARIZE" == "true" ]]; then
         echo "==> Model '${OLLAMA_MODEL}' already cached."
     fi
 
-    # Build and send summarization prompt
-    echo "==> Summarizing transcript with '${OLLAMA_MODEL}'..."
-
+    echo "==> Summarizing with '${OLLAMA_MODEL}'..."
     TRANSCRIPT_TEXT=$(cat "$TRANSCRIPT_FILE")
     SUMMARY_FILE="${OUTPUT_DIR}/${SAFE_TITLE}_summary.md"
 
@@ -334,13 +415,12 @@ ${TRANSCRIPT_TEXT}"
         -d "$(jq -n --arg model "$OLLAMA_MODEL" --arg prompt "$PROMPT" \
             '{model: $model, prompt: $prompt, stream: false}')")
 
-    # Write markdown summary file with header metadata
     {
         echo "# ${VIDEO_TITLE}"
         echo ""
         echo "_Source: ${YT_URL}_"
         echo ""
-        echo "_Transcribed with Whisper \`${WHISPER_MODEL}\` — Summarized with Ollama \`${OLLAMA_MODEL}\`_"
+        echo "_Transcribed via: ${TRANSCRIPT_SOURCE} — Summarized with Ollama \`${OLLAMA_MODEL}\`_"
         echo ""
         echo "---"
         echo ""
@@ -348,16 +428,14 @@ ${TRANSCRIPT_TEXT}"
     } > "$SUMMARY_FILE"
 
     echo "==> Summary     : ${SUMMARY_FILE}"
-
 fi
 
-# ─── Report output ────────────────────────────────────────────────────────────
+# ─── Final report ─────────────────────────────────────────────────────────────
 
 echo ""
 echo "==> Done."
-echo "    Audio      : ${AUDIO_FILE}"
-echo "    Transcript : ${TRANSCRIPT_FILE}"
-if [[ -n "$SUMMARY_FILE" ]]; then
-    echo "    Summary    : ${SUMMARY_FILE}"
-fi
-echo "    All outputs: ${OUTPUT_DIR}"
+echo "    Audio            : ${AUDIO_FILE}"
+echo "    Transcript       : ${TRANSCRIPT_FILE}"
+echo "    Transcript source: ${TRANSCRIPT_SOURCE}"
+[[ -n "$SUMMARY_FILE" ]] && echo "    Summary          : ${SUMMARY_FILE}"
+echo "    All outputs      : ${OUTPUT_DIR}"

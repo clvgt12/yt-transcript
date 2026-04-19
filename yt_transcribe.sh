@@ -2,15 +2,17 @@
 # yt_transcribe.sh — Download YouTube audio, transcribe with Whisper, optionally summarize with Ollama
 #
 # Usage:
-#   ./yt_transcribe.sh <YouTube_URL> [whisper_model] [ollama_model] [--summarize]
+#   ./yt_transcribe.sh <YouTube_URL> [options]
 #
 # Arguments:
-#   YouTube_URL     Full YouTube video URL (required)
-#   whisper_model   Whisper model: tiny, base, small, medium, large (default: base)
-#   ollama_model    Ollama model for summarization (default: gemma3:1b)
+#   YouTube_URL              Full YouTube video URL (required)
 #
-# Flags:
-#   --summarize     Enable Ollama summarization stage (disabled by default)
+# Options:
+#   --whisper=MODEL          Whisper model: tiny, base, small, medium, large
+#                            (default: base)
+#   --summarize[=MODEL]      Enable Ollama summarization. Optionally specify
+#                            the Ollama model name (default: gemma3:1b)
+#   -h, --help               Show this help message and exit
 #
 # Dependencies:
 #   - yt-dlp        (snap: yt-dlp)
@@ -32,13 +34,14 @@
 #   - PyTorch 2.2.0+cu118 with numpy<2 required for GTX 1050 Ti (Pascal/sm_61)
 #   - Download is skipped if an MP3 already exists in the output directory
 #   - Ollama runs in a temporary container on port 11435, removed after use
-#   - Ollama model weights are cached in a persistent Docker volume
+#   - Ollama model weights are reused from the existing 'ollama' Docker volume
 #
 # Examples:
 #   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX"
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" medium
-#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" base gemma3:1b --summarize
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --whisper=medium
 #   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --summarize
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --summarize=qwen3:1.7b
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --whisper=small --summarize=gemma3:1b
 #
 # Change history:
 #   See git log for revision history
@@ -60,30 +63,30 @@ GPU_MODELS="tiny base small"
 OLLAMA_IMAGE="ollama/ollama"
 OLLAMA_CONTAINER="yt-transcribe-ollama-$$"   # $$ = PID, ensures uniqueness
 OLLAMA_HOST_PORT="11435"                       # Dedicated port, avoids conflict with existing Ollama
-OLLAMA_VOLUME="ollama"   # Persistent volume for cached model weights
+OLLAMA_VOLUME="ollama"                         # Reuse existing ollama Docker volume
 OLLAMA_URL="http://localhost:${OLLAMA_HOST_PORT}"
 
 # ─── Argument handling ────────────────────────────────────────────────────────
 
 usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,1\}//'
-    exit 1
+    exit 0
 }
-
-if [[ $# -lt 1 ]]; then
-    echo "Error: YouTube URL is required." >&2
-    usage
-fi
 
 YT_URL=""
 WHISPER_MODEL="$DEFAULT_WHISPER_MODEL"
 OLLAMA_MODEL="$DEFAULT_OLLAMA_MODEL"
 SUMMARIZE=false
 
-# Parse arguments — positional and flag order-independent
-POSITIONAL=()
 for arg in "$@"; do
     case "$arg" in
+        --whisper=*)
+            WHISPER_MODEL="${arg#--whisper=}"
+            ;;
+        --summarize=*)
+            SUMMARIZE=true
+            OLLAMA_MODEL="${arg#--summarize=}"
+            ;;
         --summarize)
             SUMMARIZE=true
             ;;
@@ -91,23 +94,26 @@ for arg in "$@"; do
             usage
             ;;
         --*)
-            echo "Error: Unknown flag '${arg}'" >&2
-            usage
+            echo "Error: Unknown option '${arg}'" >&2
+            echo "       Run with --help for usage." >&2
+            exit 1
             ;;
         *)
-            POSITIONAL+=("$arg")
+            if [[ -z "$YT_URL" ]]; then
+                YT_URL="$arg"
+            else
+                echo "Error: Unexpected argument '${arg}'" >&2
+                echo "       Run with --help for usage." >&2
+                exit 1
+            fi
             ;;
     esac
 done
 
-# Assign positional arguments
-YT_URL="${POSITIONAL[0]:-}"
-WHISPER_MODEL="${POSITIONAL[1]:-$DEFAULT_WHISPER_MODEL}"
-OLLAMA_MODEL="${POSITIONAL[2]:-$DEFAULT_OLLAMA_MODEL}"
-
 if [[ -z "$YT_URL" ]]; then
     echo "Error: YouTube URL is required." >&2
-    usage
+    echo "       Run with --help for usage." >&2
+    exit 1
 fi
 
 # Validate Whisper model name
@@ -186,9 +192,10 @@ echo "==> Video ID      : ${VIDEO_ID}"
 echo "==> Title         : ${VIDEO_TITLE}"
 echo "==> Output dir    : ${OUTPUT_DIR}"
 echo "==> Whisper model : ${WHISPER_MODEL} (${WHISPER_DEVICE})"
-echo "==> Summarize     : ${SUMMARIZE}"
 if [[ "$SUMMARIZE" == "true" ]]; then
-    echo "==> Ollama model  : ${OLLAMA_MODEL}"
+    echo "==> Summarize     : yes (${OLLAMA_MODEL})"
+else
+    echo "==> Summarize     : no"
 fi
 if [[ "$WHISPER_DEVICE" == "cpu" ]]; then
     echo "    Note: medium/large models exceed available VRAM — Whisper falling back to CPU"
@@ -257,7 +264,6 @@ if [[ "$SUMMARIZE" == "true" ]]; then
 
     echo ""
     echo "==> Starting Ollama container (${OLLAMA_CONTAINER}) on port ${OLLAMA_HOST_PORT}..."
-
 
     docker run -d \
         --name "$OLLAMA_CONTAINER" \

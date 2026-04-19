@@ -7,7 +7,7 @@
 #
 # Options:
 #   --whisper=MODEL          Whisper model: tiny, base, small, medium, large (default: small)
-#   --summarize[=MODEL]      Enable Ollama summarization, optionally specify model (default: gemma3:1b)
+#   --summarize[=MODEL]      Enable Ollama summarization, optionally specify model (default: qwen3:1.7b)
 #   --force-whisper          Skip subtitle check, always use Whisper for transcription
 #   -h, --help               Show this help and exit
 #
@@ -143,7 +143,7 @@ export -f _vtt_to_txt 2>/dev/null || true
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/openai-whisper}"
 OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads}"
 DEFAULT_WHISPER_MODEL="small"
-DEFAULT_OLLAMA_MODEL="gemma3:1b"
+DEFAULT_OLLAMA_MODEL="qwen3:1.7b"
 YT_DLP_BIN="${YT_DLP_BIN:-/snap/bin/yt-dlp}"
 
 # Ollama settings

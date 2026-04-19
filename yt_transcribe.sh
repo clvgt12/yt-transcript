@@ -413,52 +413,6 @@ SUMMARY_FILE=""
 
 if [[ "$SUMMARIZE" == "true" ]]; then
 
-    if [[ -n "$OLLAMA_EXTERNAL" && "$OLLAMA_EXTERNAL" != "http://localhost:"* ]]; then
-        echo ""
-        echo "==> Using external Ollama service at ${OLLAMA_URL}"
-        READY=false
-        for i in $(seq 1 30); do
-            if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
-                READY=true; break
-            fi
-            sleep 1
-        done
-        [[ "$READY" != "true" ]] && { echo "Error: Ollama not reachable at ${OLLAMA_URL}" >&2; exit 1; }
-    else
-        echo ""
-        echo "==> Starting local Ollama container (${OLLAMA_CONTAINER})..."
-        docker volume create "$OLLAMA_VOLUME" &>/dev/null || true
-        docker run -d \
-            --name "$OLLAMA_CONTAINER" \
-            --gpus all \
-            -p "${OLLAMA_HOST_PORT}:11434" \
-            -v "${OLLAMA_VOLUME}:/root/.ollama" \
-            "$OLLAMA_IMAGE" &>/dev/null
-        OLLAMA_STARTED=true
-
-        echo "==> Waiting for Ollama API..."
-        READY=false
-        for i in $(seq 1 30); do
-            if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
-                READY=true; break
-            fi
-            sleep 1
-        done
-        [[ "$READY" != "true" ]] && { echo "Error: Ollama did not become ready." >&2; exit 1; }
-    fi
-
-    echo "==> Ollama ready. Checking model '${OLLAMA_MODEL}'..."
-    MODEL_EXISTS=$(curl -sf "${OLLAMA_URL}/api/tags" | grep -c "\"${OLLAMA_MODEL}\"" || true)
-    if [[ "$MODEL_EXISTS" -eq 0 ]]; then
-        echo "==> Pulling '${OLLAMA_MODEL}'..."
-        curl -sf -X POST "${OLLAMA_URL}/api/pull" \
-            -H "Content-Type: application/json" \
-            -d "{\"name\": \"${OLLAMA_MODEL}\"}" | grep -v '^$' | tail -1
-        echo ""
-    else
-        echo "==> Model '${OLLAMA_MODEL}' already cached."
-    fi
-
     TRANSCRIPT_TEXT=$(cat "$TRANSCRIPT_FILE")
     SUMMARY_FILE="${OUTPUT_DIR}/${SAFE_TITLE}_summary.md"
 
@@ -484,27 +438,76 @@ ${TRANSCRIPT_TEXT}"
     RESPONSE=""
 
     if [[ -n "${OLLAMA_API_KEY:-}" ]]; then
+        echo ""
         echo "==> Attempting cloud summarization with '${OLLAMA_CLOUD_MODEL}'..."
-        RESPONSE=$(curl -sf -X POST "${OLLAMA_CLOUD_URL}/generate" \
+        CLOUD_RESPONSE=$(curl -sf -X POST "${OLLAMA_CLOUD_URL}/generate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
             -d "$(jq -n --arg model "$OLLAMA_CLOUD_MODEL" --arg prompt "$PROMPT" \
                 '{model: $model, prompt: $prompt, stream: false, think: false}')" \
-            2>/dev/null || true)
+            2>&1) || true
 
-        if [[ -n "$RESPONSE" ]] && echo "$RESPONSE" | jq -e '.response' &>/dev/null; then
+        if echo "$CLOUD_RESPONSE" | jq -e '.response' &>/dev/null; then
+            RESPONSE="$CLOUD_RESPONSE"
             SUMMARIZE_SOURCE="ollama-cloud:${OLLAMA_CLOUD_MODEL}"
             echo "==> Cloud summarization succeeded."
         else
-            echo "==> Cloud summarization failed — falling back to local model '${OLLAMA_MODEL}'."
-            RESPONSE=""
+            echo "==> Cloud summarization failed — reason: $(echo "$CLOUD_RESPONSE" | head -c 200)"
+            echo "==> Falling back to local model '${OLLAMA_MODEL}'."
         fi
     else
+        echo ""
         echo "==> OLLAMA_API_KEY not set — using local model '${OLLAMA_MODEL}'."
     fi
 
     # ── Attempt 2: local Ollama container (fallback or no API key) ───────────
     if [[ -z "$RESPONSE" ]]; then
+        if [[ -n "$OLLAMA_EXTERNAL" && "$OLLAMA_EXTERNAL" != "http://localhost:"* ]]; then
+            echo ""
+            echo "==> Using external Ollama service at ${OLLAMA_URL}"
+            READY=false
+            for i in $(seq 1 30); do
+                if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
+                    READY=true; break
+                fi
+                sleep 1
+            done
+            [[ "$READY" != "true" ]] && { echo "Error: Ollama not reachable at ${OLLAMA_URL}" >&2; exit 1; }
+        else
+            echo ""
+            echo "==> Starting local Ollama container (${OLLAMA_CONTAINER})..."
+            docker volume create "$OLLAMA_VOLUME" &>/dev/null || true
+            docker run -d \
+                --name "$OLLAMA_CONTAINER" \
+                --gpus all \
+                -p "${OLLAMA_HOST_PORT}:11434" \
+                -v "${OLLAMA_VOLUME}:/root/.ollama" \
+                "$OLLAMA_IMAGE" &>/dev/null
+            OLLAMA_STARTED=true
+
+            echo "==> Waiting for Ollama API..."
+            READY=false
+            for i in $(seq 1 30); do
+                if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
+                    READY=true; break
+                fi
+                sleep 1
+            done
+            [[ "$READY" != "true" ]] && { echo "Error: Ollama did not become ready." >&2; exit 1; }
+        fi
+
+        echo "==> Ollama ready. Checking model '${OLLAMA_MODEL}'..."
+        MODEL_EXISTS=$(curl -sf "${OLLAMA_URL}/api/tags" | grep -c "\"${OLLAMA_MODEL}\"" || true)
+        if [[ "$MODEL_EXISTS" -eq 0 ]]; then
+            echo "==> Pulling '${OLLAMA_MODEL}'..."
+            curl -sf -X POST "${OLLAMA_URL}/api/pull" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\": \"${OLLAMA_MODEL}\"}" | grep -v '^$' | tail -1
+            echo ""
+        else
+            echo "==> Model '${OLLAMA_MODEL}' already cached."
+        fi
+
         echo "==> Summarizing with local model '${OLLAMA_MODEL}'..."
         RESPONSE=$(curl -sf -X POST "${OLLAMA_URL}/api/generate" \
             -H "Content-Type: application/json" \

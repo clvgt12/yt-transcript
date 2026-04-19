@@ -227,38 +227,19 @@ if [[ "$WHISPER_DEVICE" == "cpu" ]]; then
     echo "    Note: medium/large models exceed available VRAM — Whisper falling back to CPU"
 fi
 
-# ─── Download audio (skip if MP3 already exists) ─────────────────────────────
-
-echo ""
-EXISTING_MP3=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
-
-if [[ -n "$EXISTING_MP3" ]]; then
-    echo "==> Audio already exists, skipping download."
-    AUDIO_FILE="$EXISTING_MP3"
-else
-    echo "==> Downloading audio..."
-    "$YT_DLP_BIN" \
-        --extract-audio \
-        --audio-format mp3 \
-        --audio-quality 0 \
-        --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
-        "$YT_URL"
-
-    AUDIO_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
-    if [[ -z "$AUDIO_FILE" ]]; then
-        echo "Error: Audio download failed — no MP3 found in ${OUTPUT_DIR}" >&2
-        exit 1
-    fi
-    echo "==> Audio saved : ${AUDIO_FILE}"
-fi
-
 # ─── Transcription — subtitle fast path, Whisper fallback ────────────────────
+# Strategy:
+#   1. Cached transcript     — reuse existing .txt, skip everything
+#   2. Human subtitles       — yt-dlp --write-subs, no audio download needed
+#   3. Auto-generated subs   — yt-dlp --write-auto-subs, no audio download needed
+#   4. Whisper               — download MP3 first, then local inference
 
 echo ""
 TRANSCRIPT_FILE=""
 TRANSCRIPT_SOURCE=""
+AUDIO_FILE=""
 
-# Check for existing transcript first (any previous run)
+# ── Check for cached transcript from a previous run ──────────────────────────
 EXISTING_TXT=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.txt" | head -1)
 if [[ -n "$EXISTING_TXT" ]]; then
     echo "==> Transcript already exists, skipping transcription."
@@ -315,6 +296,29 @@ if [[ -z "$TRANSCRIPT_FILE" ]]; then
         echo "==> No YouTube subtitles available — falling back to Whisper."
     fi
 
+    # Audio download only required for Whisper
+    EXISTING_MP3=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
+    if [[ -n "$EXISTING_MP3" ]]; then
+        echo "==> Audio already exists, skipping download."
+        AUDIO_FILE="$EXISTING_MP3"
+    else
+        echo "==> Downloading audio for Whisper..."
+        "$YT_DLP_BIN" \
+            --extract-audio \
+            --audio-format mp3 \
+            --audio-quality 0 \
+            --output "${OUTPUT_DIR}/%(title)s.%(ext)s" \
+            "$YT_URL"
+
+        AUDIO_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mp3" | head -1)
+        if [[ -z "$AUDIO_FILE" ]]; then
+            echo "Error: Audio download failed — no MP3 found in ${OUTPUT_DIR}" >&2
+            exit 1
+        fi
+        echo "==> Audio saved : ${AUDIO_FILE}"
+    fi
+
+    # shellcheck disable=SC1091
     source "${VENV_PATH}/bin/activate"
     echo "==> Transcribing with Whisper '${WHISPER_MODEL}' on ${WHISPER_DEVICE}..."
     whisper "$AUDIO_FILE" \
@@ -434,7 +438,7 @@ fi
 
 echo ""
 echo "==> Done."
-echo "    Audio            : ${AUDIO_FILE}"
+[[ -n "$AUDIO_FILE" ]] && echo "    Audio            : ${AUDIO_FILE}" || echo "    Audio            : not downloaded (subtitles used)"
 echo "    Transcript       : ${TRANSCRIPT_FILE}"
 echo "    Transcript source: ${TRANSCRIPT_SOURCE}"
 [[ -n "$SUMMARY_FILE" ]] && echo "    Summary          : ${SUMMARY_FILE}"

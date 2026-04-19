@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # yt_transcribe_test.sh — Test driver for yt_transcribe.sh
 #
-# Test matrix (6 cases):
+# Test matrix (8 cases):
 #   1. subtitles_only                    YouTube subtitles, no summarize
-#   2. subtitles_summarize_gemma3        YouTube subtitles, --summarize=gemma3:1b
-#   3. force_whisper_base_no_summary     --force-whisper --whisper=base, no summarize
-#   4. force_whisper_base_summarize_gemma3 --force-whisper --whisper=base, --summarize=gemma3:1b
-#   5. force_whisper_small_no_summary    --force-whisper --whisper=small, no summarize
-#   6. subtitles_summarize_qwen3         YouTube subtitles, --summarize=qwen3:1.7b
+#   2. subtitles_summarize_gemma3_1b     YouTube subtitles, --summarize=gemma3:1b
+#   3. whisper_base_summarize_gemma3_1b  --force-whisper --whisper=base, --summarize=gemma3:1b
+#   4. whisper_small_summarize_gemma3_1b --force-whisper --whisper=small, --summarize=gemma3:1b
+#   5. subtitles_summarize_qwen3_1_7b    YouTube subtitles, --summarize=qwen3:1.7b
+#   6. subtitles_summarize_gemma3_4b     YouTube subtitles, --summarize=gemma3:4b
+#   7. subtitles_summarize_llama3_1_8b   YouTube subtitles, --summarize=llama3.1:8b
+#   8. subtitles_summarize_qwen3_8b      YouTube subtitles, --summarize=qwen3:8b
 #
 # Qualitative alignment analysis:
 #   After all cases complete, the report automatically diffs:
@@ -25,19 +27,27 @@
 #     run_YYYYMMDD_HHMMSS/
 #       1_subtitles_only/
 #         <title>-subtitles.txt
-#       2_subtitles_summarize_gemma3/
+#       2_subtitles_summarize_gemma3_1b/
 #         <title>-subtitles.txt
 #         <title>_summary-subtitles-gemma3_1b.md
-#       3_force_whisper_base_no_summary/
-#         <title>-whisper_base.txt
-#       4_force_whisper_base_summarize_gemma3/
+#       3_whisper_base_summarize_gemma3_1b/
 #         <title>-whisper_base.txt
 #         <title>_summary-whisper_base-gemma3_1b.md
-#       5_force_whisper_small_no_summary/
+#       4_whisper_small_summarize_gemma3_1b/
 #         <title>-whisper_small.txt
-#       6_subtitles_summarize_qwen3/
+#         <title>_summary-whisper_small-gemma3_1b.md
+#       5_subtitles_summarize_qwen3_1_7b/
 #         <title>-subtitles.txt
-#         <title>_summary-subtitles-qwen3_1.7b.md
+#         <title>_summary-subtitles-qwen3_1_7b.md
+#       6_subtitles_summarize_gemma3_4b/
+#         <title>-subtitles.txt
+#         <title>_summary-subtitles-gemma3_4b.md
+#       7_subtitles_summarize_llama3_1_8b/
+#         <title>-subtitles.txt
+#         <title>_summary-subtitles-llama3_1_8b.md
+#       8_subtitles_summarize_qwen3_8b/
+#         <title>-subtitles.txt
+#         <title>_summary-subtitles-qwen3_8b.md
 #       diff_analysis/
 #         diff_subtitles_vs_whisper_small.txt
 #         diff_subtitles_vs_whisper_base.txt
@@ -49,10 +59,11 @@
 #   ./yt_transcribe_test.sh
 #
 # Notes:
-#   - Cases 1,2,6 use YouTube subtitle fast path — near instant transcription
-#   - Cases 3,4,5 use --force-whisper — GPU inference, ~3-5 min each
+#   - Cases 1,2,5,6,7,8 use YouTube subtitle fast path — near instant transcription
+#   - Cases 3,4 use --force-whisper — GPU inference, ~3-5 min each
+#   - Cases 6,7,8 use larger Ollama models — inference time will be longer
 #   - Each case runs in an isolated staging directory to prevent contamination
-#   - Estimated total runtime: 15-20 minutes
+#   - Estimated total runtime: 25-40 minutes (dominated by Ollama inference on larger models)
 #
 # Change history:
 #   See git log for revision history
@@ -80,11 +91,13 @@ STAGING_BASE="${DOWNLOADS_BASE}/.yt_transcribe_test_staging"
 
 TEST_CASES=(
     "1|subtitles_only|--whisper=small|subtitles|"
-    "2|subtitles_summarize_gemma3|--whisper=small --summarize=gemma3:1b|subtitles|gemma3_1b"
-    "3|force_whisper_base_no_summary|--whisper=base --force-whisper|whisper_base|"
-    "4|force_whisper_base_summarize_gemma3|--whisper=base --force-whisper --summarize=gemma3:1b|whisper_base|gemma3_1b"
-    "5|force_whisper_small_no_summary|--whisper=small --force-whisper|whisper_small|"
-    "6|subtitles_summarize_qwen3|--whisper=small --summarize=qwen3:1.7b|subtitles|qwen3_1.7b"
+    "2|subtitles_summarize_gemma3_1b|--whisper=small --summarize=gemma3:1b|subtitles|gemma3_1b"
+    "3|whisper_base_summarize_gemma3_1b|--whisper=base --force-whisper --summarize=gemma3:1b|whisper_base|gemma3_1b"
+    "4|whisper_small_summarize_gemma3_1b|--whisper=small --force-whisper --summarize=gemma3:1b|whisper_small|gemma3_1b"
+    "5|subtitles_summarize_qwen3_1_7b|--whisper=small --summarize=qwen3:1.7b|subtitles|qwen3_1_7b"
+    "6|subtitles_summarize_gemma3_4b|--whisper=small --summarize=gemma3:4b|subtitles|gemma3_4b"
+    "7|subtitles_summarize_llama3_1_8b|--whisper=small --summarize=llama3.1:8b|subtitles|llama3_1_8b"
+    "8|subtitles_summarize_qwen3_8b|--whisper=small --summarize=qwen3:8b|subtitles|qwen3_8b"
 )
 
 TOTAL=${#TEST_CASES[@]}
@@ -199,8 +212,8 @@ for test_case in "${TEST_CASES[@]}"; do
         # Also store by canonical label for diff lookup
         case "$CASE_SUFFIX" in
             subtitles_only)                    TRANSCRIPT_PATHS["subtitles"]="$SAVED_TRANSCRIPT" ;;
-            force_whisper_base_no_summary)     TRANSCRIPT_PATHS["whisper_base"]="$SAVED_TRANSCRIPT" ;;
-            force_whisper_small_no_summary)    TRANSCRIPT_PATHS["whisper_small"]="$SAVED_TRANSCRIPT" ;;
+            whisper_base_summarize_gemma3_1b)  TRANSCRIPT_PATHS["whisper_base"]="$SAVED_TRANSCRIPT" ;;
+            whisper_small_summarize_gemma3_1b) TRANSCRIPT_PATHS["whisper_small"]="$SAVED_TRANSCRIPT" ;;
         esac
     fi
 
@@ -313,6 +326,10 @@ log "  ${DIFF_DIR}/alignment_report.txt"
 log "  ${DIFF_DIR}/diff_subtitles_vs_whisper_base.txt"
 log "  ${DIFF_DIR}/diff_subtitles_vs_whisper_small.txt"
 log "  ${DIFF_DIR}/diff_whisper_base_vs_whisper_small.txt"
+log ""
+log "Summaries for comparison:"
+log "  Cases 2,3,4 — gemma3:1b on subtitles vs whisper_base vs whisper_small"
+log "  Cases 2,5,6,7,8 — subtitle transcript across all Ollama models"
 log_separator
 
 exit $FAIL

@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# yt_transcribe.sh — Download YouTube audio and transcribe with Whisper
+# yt_transcribe.sh — Download YouTube audio, transcribe with Whisper, optionally summarize with Ollama
 #
 # Usage:
-#   ./yt_transcribe.sh <YouTube_URL> [whisper_model]
+#   ./yt_transcribe.sh <YouTube_URL> [whisper_model] [ollama_model] [--summarize]
 #
 # Arguments:
 #   YouTube_URL     Full YouTube video URL (required)
-#   whisper_model   Whisper model to use: tiny, base, small, medium, large
-#                   Defaults to: base
+#   whisper_model   Whisper model: tiny, base, small, medium, large (default: base)
+#   ollama_model    Ollama model for summarization (default: gemma3:1b)
+#
+# Flags:
+#   --summarize     Enable Ollama summarization stage (disabled by default)
 #
 # Dependencies:
 #   - yt-dlp        (snap: yt-dlp)
 #   - ffmpeg        (apt:  ffmpeg)
 #   - whisper       (pip:  openai-whisper, inside venv at ~/venvs/openai-whisper)
+#   - docker        (apt:  docker.io or docker-ce)  [required only with --summarize]
+#   - jq            (apt:  jq)                      [required only with --summarize]
 #
-# Output:
-#   Audio and transcript files are written to ~/Downloads/<video_id>/
+# Output (written to ~/Downloads/<video_id>/):
+#   <title>.mp3     Downloaded audio
+#   <title>.txt     Whisper transcript
+#   <title>.md      Ollama summary in markdown (only with --summarize)
 #
 # Notes:
 #   - Whisper model weights are cached in ~/.cache/whisper/ on first use
@@ -24,6 +31,14 @@
 #     has insufficient VRAM for larger models alongside the KDE desktop stack)
 #   - PyTorch 2.2.0+cu118 with numpy<2 required for GTX 1050 Ti (Pascal/sm_61)
 #   - Download is skipped if an MP3 already exists in the output directory
+#   - Ollama runs in a temporary container on port 11435, removed after use
+#   - Ollama model weights are cached in a persistent Docker volume
+#
+# Examples:
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX"
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" medium
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" base gemma3:1b --summarize
+#   ./yt_transcribe.sh "https://youtube.com/watch?v=XXXXX" --summarize
 #
 # Change history:
 #   See git log for revision history
@@ -34,11 +49,19 @@ set -euo pipefail
 
 VENV_PATH="${HOME}/venvs/openai-whisper"
 OUTPUT_BASE="${HOME}/Downloads"
-DEFAULT_MODEL="base"
+DEFAULT_WHISPER_MODEL="base"
+DEFAULT_OLLAMA_MODEL="gemma3:1b"
 YT_DLP_BIN="/snap/bin/yt-dlp"
 
 # Models that fit in VRAM alongside the KDE desktop stack (~1.5 GB overhead)
 GPU_MODELS="tiny base small"
+
+# Ollama container settings
+OLLAMA_IMAGE="ollama/ollama"
+OLLAMA_CONTAINER="yt-transcribe-ollama-$$"   # $$ = PID, ensures uniqueness
+OLLAMA_HOST_PORT="11435"                       # Dedicated port, avoids conflict with existing Ollama
+OLLAMA_VOLUME="yt-transcribe-ollama-models"   # Persistent volume for cached model weights
+OLLAMA_URL="http://localhost:${OLLAMA_HOST_PORT}"
 
 # ─── Argument handling ────────────────────────────────────────────────────────
 
@@ -52,17 +75,49 @@ if [[ $# -lt 1 ]]; then
     usage
 fi
 
-YT_URL="$1"
-WHISPER_MODEL="${2:-$DEFAULT_MODEL}"
+YT_URL=""
+WHISPER_MODEL="$DEFAULT_WHISPER_MODEL"
+OLLAMA_MODEL="$DEFAULT_OLLAMA_MODEL"
+SUMMARIZE=false
 
-# Validate model name
+# Parse arguments — positional and flag order-independent
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --summarize)
+            SUMMARIZE=true
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --*)
+            echo "Error: Unknown flag '${arg}'" >&2
+            usage
+            ;;
+        *)
+            POSITIONAL+=("$arg")
+            ;;
+    esac
+done
+
+# Assign positional arguments
+YT_URL="${POSITIONAL[0]:-}"
+WHISPER_MODEL="${POSITIONAL[1]:-$DEFAULT_WHISPER_MODEL}"
+OLLAMA_MODEL="${POSITIONAL[2]:-$DEFAULT_OLLAMA_MODEL}"
+
+if [[ -z "$YT_URL" ]]; then
+    echo "Error: YouTube URL is required." >&2
+    usage
+fi
+
+# Validate Whisper model name
 VALID_MODELS="tiny base small medium large"
 if ! echo "$VALID_MODELS" | grep -qw "$WHISPER_MODEL"; then
-    echo "Error: Invalid model '${WHISPER_MODEL}'. Choose from: ${VALID_MODELS}" >&2
+    echo "Error: Invalid Whisper model '${WHISPER_MODEL}'. Choose from: ${VALID_MODELS}" >&2
     exit 1
 fi
 
-# Select device based on model size
+# Select Whisper compute device based on model size
 if echo "$GPU_MODELS" | grep -qw "$WHISPER_MODEL"; then
     WHISPER_DEVICE="cuda"
 else
@@ -83,12 +138,33 @@ check_dep() {
 check_dep "$YT_DLP_BIN"  "Install with: sudo snap install yt-dlp"
 check_dep "ffmpeg"        "Install with: sudo apt install ffmpeg"
 
+if [[ "$SUMMARIZE" == "true" ]]; then
+    check_dep "docker"   "Install with: sudo apt install docker.io"
+    check_dep "curl"     "Install with: sudo apt install curl"
+    check_dep "jq"       "Install with: sudo apt install jq"
+fi
+
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
     echo "Error: Whisper venv not found at ${VENV_PATH}" >&2
     echo "       Create it with: python3 -m venv ${VENV_PATH}" >&2
     echo "       Then: source ${VENV_PATH}/bin/activate && pip install -r ${VENV_PATH}/requirements.txt" >&2
     exit 1
 fi
+
+# ─── Cleanup trap — always remove Ollama container on exit ───────────────────
+
+OLLAMA_STARTED=false
+
+cleanup() {
+    if [[ "$OLLAMA_STARTED" == "true" ]]; then
+        echo ""
+        echo "==> Stopping and removing Ollama container (${OLLAMA_CONTAINER})..."
+        docker stop "$OLLAMA_CONTAINER" &>/dev/null || true
+        docker rm   "$OLLAMA_CONTAINER" &>/dev/null || true
+        echo "==> Ollama container removed."
+    fi
+}
+trap cleanup EXIT
 
 # ─── Resolve video ID for output directory naming ─────────────────────────────
 
@@ -106,13 +182,16 @@ SAFE_TITLE=$(echo "$VIDEO_TITLE" | tr -cd '[:alnum:] _-' | tr ' ' '_' | cut -c1-
 OUTPUT_DIR="${OUTPUT_BASE}/${VIDEO_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-echo "==> Video ID    : ${VIDEO_ID}"
-echo "==> Title       : ${VIDEO_TITLE}"
-echo "==> Output dir  : ${OUTPUT_DIR}"
-echo "==> Whisper model: ${WHISPER_MODEL}"
-echo "==> Compute device: ${WHISPER_DEVICE}"
+echo "==> Video ID      : ${VIDEO_ID}"
+echo "==> Title         : ${VIDEO_TITLE}"
+echo "==> Output dir    : ${OUTPUT_DIR}"
+echo "==> Whisper model : ${WHISPER_MODEL} (${WHISPER_DEVICE})"
+echo "==> Summarize     : ${SUMMARIZE}"
+if [[ "$SUMMARIZE" == "true" ]]; then
+    echo "==> Ollama model  : ${OLLAMA_MODEL}"
+fi
 if [[ "$WHISPER_DEVICE" == "cpu" ]]; then
-    echo "    (medium/large models exceed available VRAM — falling back to CPU)"
+    echo "    Note: medium/large models exceed available VRAM — Whisper falling back to CPU"
 fi
 
 # ─── Download audio (skip if MP3 already exists) ─────────────────────────────
@@ -161,12 +240,120 @@ whisper "$AUDIO_FILE" \
 
 deactivate
 
-# ─── Report output ────────────────────────────────────────────────────────────
-
 TRANSCRIPT_FILE=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.txt" | head -1)
+
+if [[ -z "$TRANSCRIPT_FILE" ]]; then
+    echo "Error: Transcription failed — no .txt file found in ${OUTPUT_DIR}" >&2
+    exit 1
+fi
+
+echo "==> Transcript  : ${TRANSCRIPT_FILE}"
+
+# ─── Summarize with Ollama (optional) ────────────────────────────────────────
+
+SUMMARY_FILE=""
+
+if [[ "$SUMMARIZE" == "true" ]]; then
+
+    echo ""
+    echo "==> Starting Ollama container (${OLLAMA_CONTAINER}) on port ${OLLAMA_HOST_PORT}..."
+
+    # Create persistent volume for model weights if it doesn't exist
+    docker volume create "$OLLAMA_VOLUME" &>/dev/null
+
+    docker run -d \
+        --name "$OLLAMA_CONTAINER" \
+        --gpus all \
+        -p "${OLLAMA_HOST_PORT}:11434" \
+        -v "${OLLAMA_VOLUME}:/root/.ollama" \
+        "$OLLAMA_IMAGE" &>/dev/null
+
+    OLLAMA_STARTED=true
+
+    # Wait for Ollama API to become ready (up to 30 seconds)
+    echo "==> Waiting for Ollama API to be ready..."
+    READY=false
+    for i in $(seq 1 30); do
+        if curl -sf "${OLLAMA_URL}/api/tags" &>/dev/null; then
+            READY=true
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$READY" != "true" ]]; then
+        echo "Error: Ollama API did not become ready within 30 seconds." >&2
+        exit 1
+    fi
+
+    echo "==> Ollama ready."
+
+    # Pull model if not already cached in the volume
+    echo "==> Checking for model '${OLLAMA_MODEL}'..."
+    MODEL_EXISTS=$(curl -sf "${OLLAMA_URL}/api/tags" | grep -c "\"${OLLAMA_MODEL}\"" || true)
+
+    if [[ "$MODEL_EXISTS" -eq 0 ]]; then
+        echo "==> Pulling model '${OLLAMA_MODEL}' (first use — cached to Docker volume)..."
+        curl -sf -X POST "${OLLAMA_URL}/api/pull" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"${OLLAMA_MODEL}\"}" | grep -v '^$' | tail -1
+        echo ""
+    else
+        echo "==> Model '${OLLAMA_MODEL}' already cached."
+    fi
+
+    # Build and send summarization prompt
+    echo "==> Summarizing transcript with '${OLLAMA_MODEL}'..."
+
+    TRANSCRIPT_TEXT=$(cat "$TRANSCRIPT_FILE")
+    SUMMARY_FILE="${OUTPUT_DIR}/${SAFE_TITLE}_summary.md"
+
+    PROMPT="You are a professional analyst. Read the following transcript carefully and produce a structured summary in Markdown format with exactly three sections:
+
+## Summary
+Write a concise summary of 3-5 sentences covering the core subject and conclusions.
+
+## Key Points
+Bullet list of the most important facts, arguments, or events from the transcript.
+
+## Takeaways
+Bullet list of the key insights, implications, or action items a reader should walk away with.
+
+Use clean Markdown formatting. Be precise and objective. Do not editorialize.
+
+---
+TRANSCRIPT:
+${TRANSCRIPT_TEXT}"
+
+    RESPONSE=$(curl -sf -X POST "${OLLAMA_URL}/api/generate" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg model "$OLLAMA_MODEL" --arg prompt "$PROMPT" \
+            '{model: $model, prompt: $prompt, stream: false}')")
+
+    # Write markdown summary file with header metadata
+    {
+        echo "# ${VIDEO_TITLE}"
+        echo ""
+        echo "_Source: ${YT_URL}_"
+        echo ""
+        echo "_Transcribed with Whisper \`${WHISPER_MODEL}\` — Summarized with Ollama \`${OLLAMA_MODEL}\`_"
+        echo ""
+        echo "---"
+        echo ""
+        echo "$RESPONSE" | jq -r '.response'
+    } > "$SUMMARY_FILE"
+
+    echo "==> Summary     : ${SUMMARY_FILE}"
+
+fi
+
+# ─── Report output ────────────────────────────────────────────────────────────
 
 echo ""
 echo "==> Done."
 echo "    Audio      : ${AUDIO_FILE}"
-echo "    Transcript : ${TRANSCRIPT_FILE:-'(not found — check for errors above)'}"
+echo "    Transcript : ${TRANSCRIPT_FILE}"
+if [[ -n "$SUMMARY_FILE" ]]; then
+    echo "    Summary    : ${SUMMARY_FILE}"
+fi
 echo "    All outputs: ${OUTPUT_DIR}"

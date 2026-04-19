@@ -60,7 +60,7 @@ GPU_MODELS="tiny base small"
 OLLAMA_IMAGE="ollama/ollama"
 OLLAMA_CONTAINER="yt-transcribe-ollama-$$"   # $$ = PID, ensures uniqueness
 OLLAMA_HOST_PORT="11435"                       # Dedicated port, avoids conflict with existing Ollama
-OLLAMA_VOLUME="yt-transcribe-ollama-models"   # Persistent volume for cached model weights
+OLLAMA_VOLUME="ollama"   # Persistent volume for cached model weights
 OLLAMA_URL="http://localhost:${OLLAMA_HOST_PORT}"
 
 # ─── Argument handling ────────────────────────────────────────────────────────
@@ -258,8 +258,6 @@ if [[ "$SUMMARIZE" == "true" ]]; then
     echo ""
     echo "==> Starting Ollama container (${OLLAMA_CONTAINER}) on port ${OLLAMA_HOST_PORT}..."
 
-    # Create persistent volume for model weights if it doesn't exist
-    docker volume create "$OLLAMA_VOLUME" &>/dev/null
 
     docker run -d \
         --name "$OLLAMA_CONTAINER" \

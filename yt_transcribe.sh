@@ -264,6 +264,7 @@ elif [[ "$FORCE_WHISPER" == "false" ]]; then
         echo "==> Human subtitles found: ${VTT_FILE}"
         TRANSCRIPT_FILE="${OUTPUT_DIR}/${SAFE_TITLE}.txt"
         _vtt_to_txt "$VTT_FILE" "$TRANSCRIPT_FILE"
+        rm -f "$VTT_FILE"
         TRANSCRIPT_SOURCE="youtube-subtitles"
 
     else
@@ -283,6 +284,7 @@ elif [[ "$FORCE_WHISPER" == "false" ]]; then
             echo "==> Auto-generated subtitles found: ${VTT_FILE}"
             TRANSCRIPT_FILE="${OUTPUT_DIR}/${SAFE_TITLE}.txt"
             _vtt_to_txt "$VTT_FILE" "$TRANSCRIPT_FILE"
+            rm -f "$VTT_FILE"
             TRANSCRIPT_SOURCE="youtube-auto-subtitles"
         fi
     fi

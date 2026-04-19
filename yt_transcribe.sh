@@ -20,6 +20,8 @@
 # Notes:
 #   - Whisper model weights are cached in ~/.cache/whisper/ on first use
 #   - GPU (CUDA) acceleration is used automatically if available
+#   - tiny/base/small models run on GPU; medium/large run on CPU (GTX 1050 Ti
+#     has insufficient VRAM for larger models alongside the KDE desktop stack)
 #   - PyTorch 2.2.0+cu118 with numpy<2 required for GTX 1050 Ti (Pascal/sm_61)
 #   - Download is skipped if an MP3 already exists in the output directory
 #
@@ -34,6 +36,9 @@ VENV_PATH="${HOME}/venvs/openai-whisper"
 OUTPUT_BASE="${HOME}/Downloads"
 DEFAULT_MODEL="base"
 YT_DLP_BIN="/snap/bin/yt-dlp"
+
+# Models that fit in VRAM alongside the KDE desktop stack (~1.5 GB overhead)
+GPU_MODELS="tiny base small"
 
 # ─── Argument handling ────────────────────────────────────────────────────────
 
@@ -55,6 +60,13 @@ VALID_MODELS="tiny base small medium large"
 if ! echo "$VALID_MODELS" | grep -qw "$WHISPER_MODEL"; then
     echo "Error: Invalid model '${WHISPER_MODEL}'. Choose from: ${VALID_MODELS}" >&2
     exit 1
+fi
+
+# Select device based on model size
+if echo "$GPU_MODELS" | grep -qw "$WHISPER_MODEL"; then
+    WHISPER_DEVICE="cuda"
+else
+    WHISPER_DEVICE="cpu"
 fi
 
 # ─── Dependency checks ────────────────────────────────────────────────────────
@@ -98,6 +110,10 @@ echo "==> Video ID    : ${VIDEO_ID}"
 echo "==> Title       : ${VIDEO_TITLE}"
 echo "==> Output dir  : ${OUTPUT_DIR}"
 echo "==> Whisper model: ${WHISPER_MODEL}"
+echo "==> Compute device: ${WHISPER_DEVICE}"
+if [[ "$WHISPER_DEVICE" == "cpu" ]]; then
+    echo "    (medium/large models exceed available VRAM — falling back to CPU)"
+fi
 
 # ─── Download audio (skip if MP3 already exists) ─────────────────────────────
 
@@ -135,9 +151,10 @@ echo "==> Activating Whisper venv..."
 # shellcheck disable=SC1091
 source "${VENV_PATH}/bin/activate"
 
-echo "==> Transcribing with model '${WHISPER_MODEL}'..."
+echo "==> Transcribing with model '${WHISPER_MODEL}' on ${WHISPER_DEVICE}..."
 whisper "$AUDIO_FILE" \
     --model "$WHISPER_MODEL" \
+    --device "$WHISPER_DEVICE" \
     --output_dir "$OUTPUT_DIR" \
     --output_format txt \
     --verbose False

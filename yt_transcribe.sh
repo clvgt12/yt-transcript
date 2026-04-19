@@ -9,6 +9,7 @@
 #   --whisper=MODEL          Whisper model: tiny, base, small, medium, large (default: small)
 #   --summarize[=MODEL]      Enable Ollama summarization, optionally specify model (default: qwen3:1.7b)
 #   --force-whisper          Skip subtitle check, always use Whisper for transcription
+#   --force-local-summary    Skip Ollama cloud API, summarize with local model only
 #   -h, --help               Show this help and exit
 #
 # Transcription strategy (in order of preference):
@@ -177,13 +178,15 @@ WHISPER_MODEL="$DEFAULT_WHISPER_MODEL"
 OLLAMA_MODEL="$DEFAULT_OLLAMA_MODEL"
 SUMMARIZE=false
 FORCE_WHISPER=false
+FORCE_LOCAL_SUMMARY=false
 
 for arg in "$@"; do
     case "$arg" in
         --whisper=*)     WHISPER_MODEL="${arg#--whisper=}" ;;
         --summarize=*)   SUMMARIZE=true; OLLAMA_MODEL="${arg#--summarize=}" ;;
         --summarize)     SUMMARIZE=true ;;
-        --force-whisper) FORCE_WHISPER=true ;;
+        --force-whisper)        FORCE_WHISPER=true ;;
+        --force-local-summary)  FORCE_LOCAL_SUMMARY=true ;;
         --help|-h)       usage ;;
         --*)
             echo "Error: Unknown option '${arg}'" >&2
@@ -279,7 +282,9 @@ echo "==> Output dir    : ${OUTPUT_DIR}"
 echo "==> Whisper model : ${WHISPER_MODEL} (${WHISPER_DEVICE})"
 echo "==> Force Whisper : ${FORCE_WHISPER}"
 if [[ "$SUMMARIZE" == "true" ]]; then
-    if [[ -n "${OLLAMA_API_KEY:-}" ]]; then
+    if [[ "$FORCE_LOCAL_SUMMARY" == "true" ]]; then
+        echo "==> Summarize     : yes (local only: ${OLLAMA_MODEL})"
+    elif [[ -n "${OLLAMA_API_KEY:-}" ]]; then
         echo "==> Summarize     : yes (cloud: ${OLLAMA_CLOUD_MODEL} → fallback: ${OLLAMA_MODEL})"
     else
         echo "==> Summarize     : yes (local: ${OLLAMA_MODEL})"
@@ -437,7 +442,7 @@ ${TRANSCRIPT_TEXT}"
     SUMMARIZE_SOURCE=""
     RESPONSE=""
 
-    if [[ -n "${OLLAMA_API_KEY:-}" ]]; then
+    if [[ "$FORCE_LOCAL_SUMMARY" != "true" && -n "${OLLAMA_API_KEY:-}" ]]; then
         echo ""
         echo "==> Attempting cloud summarization with '${OLLAMA_CLOUD_MODEL}'..."
         CLOUD_RESPONSE=$(curl -sf -X POST "${OLLAMA_CLOUD_URL}/generate" \
@@ -457,7 +462,11 @@ ${TRANSCRIPT_TEXT}"
         fi
     else
         echo ""
-        echo "==> OLLAMA_API_KEY not set — using local model '${OLLAMA_MODEL}'."
+        if [[ "$FORCE_LOCAL_SUMMARY" == "true" ]]; then
+            echo "==> --force-local-summary set — skipping cloud, using local model '${OLLAMA_MODEL}'."
+        else
+            echo "==> OLLAMA_API_KEY not set — using local model '${OLLAMA_MODEL}'."
+        fi
     fi
 
     # ── Attempt 2: local Ollama container (fallback or no API key) ───────────

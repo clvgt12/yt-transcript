@@ -131,7 +131,7 @@ with open(txt_path, "w", encoding="utf-8") as f:
     f.write(output + "\n")
 
 print(f"Converted {len(merged)} lines → {len(paragraphs)} paragraphs → {txt_path}")
-'INNEREOF'
+INNEREOF
 }
 
 # Export function so it's available in the script scope

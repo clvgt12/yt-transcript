@@ -19,7 +19,7 @@
 # Environment variables (set by Docker Compose):
 #   YT_DLP_BIN               Path to yt-dlp binary (default: /usr/local/bin/yt-dlp)
 #   OUTPUT_BASE              Output root directory (default: /outputs)
-#   VENV_PATH                Python venv path (default: /venv)
+#   VENV_PATH                Python venv path (default: ~/venvs/openai-whisper)
 #   OLLAMA_URL               Ollama API base URL (default: http://ollama:11434)
 #   OLLAMA_HOST_PORT         Ollama container port (default: 11434)
 #
@@ -88,7 +88,7 @@ export -f _vtt_to_txt 2>/dev/null || true
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-VENV_PATH="${VENV_PATH:-/venv}"
+VENV_PATH="${VENV_PATH:-${HOME}/venvs/openai-whisper}"
 OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads}"
 DEFAULT_WHISPER_MODEL="small"
 DEFAULT_OLLAMA_MODEL="gemma3:1b"

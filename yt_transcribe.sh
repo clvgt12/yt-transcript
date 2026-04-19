@@ -143,18 +143,24 @@ export -f _vtt_to_txt 2>/dev/null || true
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/openai-whisper}"
-OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads/yt_transcribe}"
+OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads}"
 DEFAULT_WHISPER_MODEL="small"
 DEFAULT_OLLAMA_MODEL="qwen3:1.7b"
 YT_DLP_BIN="${YT_DLP_BIN:-/snap/bin/yt-dlp}"
 
-# Ollama settings
+# Ollama local container settings
 OLLAMA_IMAGE="ollama/ollama"
 OLLAMA_CONTAINER="yt-transcribe-ollama-$$"
 OLLAMA_HOST_PORT="${OLLAMA_HOST_PORT:-11435}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:${OLLAMA_HOST_PORT}}"
 OLLAMA_EXTERNAL="${OLLAMA_URL:-}"
 OLLAMA_VOLUME="ollama"
+
+# Ollama cloud settings
+OLLAMA_CLOUD_URL="https://ollama.com/api"
+DEFAULT_OLLAMA_CLOUD_MODEL="qwen3.5:27b"
+OLLAMA_CLOUD_MODEL="${OLLAMA_CLOUD_MODEL:-${DEFAULT_OLLAMA_CLOUD_MODEL}}"
+# OLLAMA_API_KEY read from environment — not set here
 
 # Models that fit in VRAM alongside the KDE desktop stack (~1.5 GB overhead)
 GPU_MODELS="tiny base small"
@@ -273,7 +279,11 @@ echo "==> Output dir    : ${OUTPUT_DIR}"
 echo "==> Whisper model : ${WHISPER_MODEL} (${WHISPER_DEVICE})"
 echo "==> Force Whisper : ${FORCE_WHISPER}"
 if [[ "$SUMMARIZE" == "true" ]]; then
-    echo "==> Summarize     : yes (${OLLAMA_MODEL})"
+    if [[ -n "${OLLAMA_API_KEY:-}" ]]; then
+        echo "==> Summarize     : yes (cloud: ${OLLAMA_CLOUD_MODEL} → fallback: ${OLLAMA_MODEL})"
+    else
+        echo "==> Summarize     : yes (local: ${OLLAMA_MODEL})"
+    fi
 else
     echo "==> Summarize     : no"
 fi
@@ -449,7 +459,6 @@ if [[ "$SUMMARIZE" == "true" ]]; then
         echo "==> Model '${OLLAMA_MODEL}' already cached."
     fi
 
-    echo "==> Summarizing with '${OLLAMA_MODEL}'..."
     TRANSCRIPT_TEXT=$(cat "$TRANSCRIPT_FILE")
     SUMMARY_FILE="${OUTPUT_DIR}/${SAFE_TITLE}_summary.md"
 
@@ -470,17 +479,46 @@ Use clean Markdown formatting. Be precise and objective. Do not editorialize.
 TRANSCRIPT:
 ${TRANSCRIPT_TEXT}"
 
-    RESPONSE=$(curl -sf -X POST "${OLLAMA_URL}/api/generate" \
-        -H "Content-Type: application/json" \
-        -d "$(jq -n --arg model "$OLLAMA_MODEL" --arg prompt "$PROMPT" \
-            '{model: $model, prompt: $prompt, stream: false, think: false}')")
+    # ── Attempt 1: Ollama cloud API ──────────────────────────────────────────
+    SUMMARIZE_SOURCE=""
+    RESPONSE=""
+
+    if [[ -n "${OLLAMA_API_KEY:-}" ]]; then
+        echo "==> Attempting cloud summarization with '${OLLAMA_CLOUD_MODEL}'..."
+        RESPONSE=$(curl -sf -X POST "${OLLAMA_CLOUD_URL}/generate" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
+            -d "$(jq -n --arg model "$OLLAMA_CLOUD_MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, prompt: $prompt, stream: false, think: false}')" \
+            2>/dev/null || true)
+
+        if [[ -n "$RESPONSE" ]] && echo "$RESPONSE" | jq -e '.response' &>/dev/null; then
+            SUMMARIZE_SOURCE="ollama-cloud:${OLLAMA_CLOUD_MODEL}"
+            echo "==> Cloud summarization succeeded."
+        else
+            echo "==> Cloud summarization failed — falling back to local model '${OLLAMA_MODEL}'."
+            RESPONSE=""
+        fi
+    else
+        echo "==> OLLAMA_API_KEY not set — using local model '${OLLAMA_MODEL}'."
+    fi
+
+    # ── Attempt 2: local Ollama container (fallback or no API key) ───────────
+    if [[ -z "$RESPONSE" ]]; then
+        echo "==> Summarizing with local model '${OLLAMA_MODEL}'..."
+        RESPONSE=$(curl -sf -X POST "${OLLAMA_URL}/api/generate" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg model "$OLLAMA_MODEL" --arg prompt "$PROMPT" \
+                '{model: $model, prompt: $prompt, stream: false, think: false}')")
+        SUMMARIZE_SOURCE="ollama-local:${OLLAMA_MODEL}"
+    fi
 
     {
         echo "# ${VIDEO_TITLE}"
         echo ""
         echo "_Source: ${YT_URL}_"
         echo ""
-        echo "_Transcribed via: ${TRANSCRIPT_SOURCE} — Summarized with Ollama \`${OLLAMA_MODEL}\`_"
+        echo "_Transcribed via: ${TRANSCRIPT_SOURCE} — Summarized with Ollama \`${SUMMARIZE_SOURCE}\`_"
         echo ""
         echo "---"
         echo ""

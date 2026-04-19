@@ -52,7 +52,7 @@ set -euo pipefail
 
 VENV_PATH="${HOME}/venvs/openai-whisper"
 OUTPUT_BASE="${HOME}/Downloads"
-DEFAULT_WHISPER_MODEL="base"
+DEFAULT_WHISPER_MODEL="small"
 DEFAULT_OLLAMA_MODEL="gemma3:1b"
 YT_DLP_BIN="/snap/bin/yt-dlp"
 

@@ -30,7 +30,7 @@ set -euo pipefail
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 VENV_PATH="${HOME}/venvs/openai-whisper"
-OUTPUT_BASE="${HOME}/yt_transcribe"
+OUTPUT_BASE="${HOME}/Downloads"
 DEFAULT_MODEL="base"
 YT_DLP_BIN="/snap/bin/yt-dlp"
 

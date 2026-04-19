@@ -28,6 +28,8 @@
 
 set -euo pipefail
 
+SCRIPT_START=$(date +%s)
+
 # ─── VTT to plain text converter ─────────────────────────────────────────────
 # Defined as a function — strips WebVTT headers, timestamps, and duplicate lines
 
@@ -491,6 +493,11 @@ fi
 
 # ─── Final report ─────────────────────────────────────────────────────────────
 
+SCRIPT_END=$(date +%s)
+ELAPSED=$(( SCRIPT_END - SCRIPT_START ))
+ELAPSED_MIN=$(( ELAPSED / 60 ))
+ELAPSED_SEC=$(( ELAPSED % 60 ))
+
 echo ""
 echo "==> Done."
 [[ -n "$AUDIO_FILE" ]] && echo "    Audio            : ${AUDIO_FILE}" || echo "    Audio            : not downloaded (subtitles used)"
@@ -498,3 +505,4 @@ echo "    Transcript       : ${TRANSCRIPT_FILE}"
 echo "    Transcript source: ${TRANSCRIPT_SOURCE}"
 [[ -n "$SUMMARY_FILE" ]] && echo "    Summary          : ${SUMMARY_FILE}"
 echo "    All outputs      : ${OUTPUT_DIR}"
+echo "    Elapsed time     : ${ELAPSED_MIN}m ${ELAPSED_SEC}s"

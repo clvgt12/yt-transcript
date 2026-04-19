@@ -471,7 +471,7 @@ ${TRANSCRIPT_TEXT}"
     RESPONSE=$(curl -sf -X POST "${OLLAMA_URL}/api/generate" \
         -H "Content-Type: application/json" \
         -d "$(jq -n --arg model "$OLLAMA_MODEL" --arg prompt "$PROMPT" \
-            '{model: $model, prompt: $prompt, stream: false}')")
+            '{model: $model, prompt: $prompt, stream: false, think: false}')")
 
     {
         echo "# ${VIDEO_TITLE}"
@@ -482,9 +482,7 @@ ${TRANSCRIPT_TEXT}"
         echo ""
         echo "---"
         echo ""
-        echo "$RESPONSE" | jq -r '.response' \
-            | perl -0pe 's|<think>.*?</think>||gs' \
-            | sed '/^[[:space:]]*$/{ N; /^\n[[:space:]]*$/d }'
+        echo "$RESPONSE" | jq -r '.response'
     } > "$SUMMARY_FILE"
 
     echo "==> Summary     : ${SUMMARY_FILE}"

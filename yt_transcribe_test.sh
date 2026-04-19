@@ -196,7 +196,6 @@ for test_case in "${TEST_CASES[@]}"; do
 
     # Store transcript path for diff analysis keyed by label
     if [[ -n "$SAVED_TRANSCRIPT" ]]; then
-        TRANSCRIPT_PATHS["$WHISPER_LABEL_${RUN_NUM}"]="$SAVED_TRANSCRIPT"
         # Also store by canonical label for diff lookup
         case "$CASE_SUFFIX" in
             subtitles_only)                    TRANSCRIPT_PATHS["subtitles"]="$SAVED_TRANSCRIPT" ;;

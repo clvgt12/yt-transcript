@@ -482,7 +482,8 @@ ${TRANSCRIPT_TEXT}"
         echo ""
         echo "---"
         echo ""
-        echo "$RESPONSE" | jq -r '.response'
+        echo "$RESPONSE" | jq -r '.response' \
+            | perl -0pe 's|<think>.*?</think>\s*||gs'
     } > "$SUMMARY_FILE"
 
     echo "==> Summary     : ${SUMMARY_FILE}"

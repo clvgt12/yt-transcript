@@ -159,7 +159,7 @@ OLLAMA_VOLUME="ollama"
 
 # Ollama cloud settings
 OLLAMA_CLOUD_URL="https://ollama.com/api"
-DEFAULT_OLLAMA_CLOUD_MODEL="gpt-oss:20b"
+DEFAULT_OLLAMA_CLOUD_MODEL="gpt-oss:120b-cloud"
 OLLAMA_CLOUD_MODEL="${OLLAMA_CLOUD_MODEL:-${DEFAULT_OLLAMA_CLOUD_MODEL}}"
 # OLLAMA_API_KEY read from environment — not set here
 

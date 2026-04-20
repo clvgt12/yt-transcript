@@ -144,7 +144,7 @@ export -f _vtt_to_txt 2>/dev/null || true
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 VENV_PATH="${VENV_PATH:-${HOME}/venvs/openai-whisper}"
-OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads}"
+OUTPUT_BASE="${OUTPUT_BASE:-${HOME}/Downloads/yt_transcribe}"
 DEFAULT_WHISPER_MODEL="small"
 DEFAULT_OLLAMA_MODEL="qwen3:1.7b"
 YT_DLP_BIN="${YT_DLP_BIN:-/snap/bin/yt-dlp}"
@@ -169,7 +169,8 @@ GPU_MODELS="tiny base small"
 # ─── Argument handling ────────────────────────────────────────────────────────
 
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,1\}//'
+    sed -n '/^# yt_transcribe/,/^# Change history/{p}' "$0" \
+        | sed 's/^# \{0,1\}//'
     exit 0
 }
 

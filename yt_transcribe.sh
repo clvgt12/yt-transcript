@@ -159,9 +159,12 @@ OLLAMA_VOLUME="ollama"
 
 # Ollama cloud settings
 OLLAMA_CLOUD_URL="https://ollama.com/api"
-DEFAULT_OLLAMA_CLOUD_MODEL="gpt-oss:120b-cloud"
+DEFAULT_OLLAMA_CLOUD_MODEL="gpt-oss:120b"
 OLLAMA_CLOUD_MODEL="${OLLAMA_CLOUD_MODEL:-${DEFAULT_OLLAMA_CLOUD_MODEL}}"
 # OLLAMA_API_KEY read from environment — not set here
+
+# Markdown editor for summary review
+MARKDOWN_EDITOR="${MARKDOWN_EDITOR:-ghostwriter}"
 
 # Models that fit in VRAM alongside the KDE desktop stack (~1.5 GB overhead)
 GPU_MODELS="tiny base small"
@@ -169,8 +172,9 @@ GPU_MODELS="tiny base small"
 # ─── Argument handling ────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '/^# yt_transcribe/,/^# Change history/{p}' "$0" \
-        | sed 's/^# \{0,1\}//'
+    # Print only the header comment block — stop at first blank comment line
+    # after the Change history section to avoid printing internal comments
+    sed -n '/^# yt_transcribe/,/^# Change history/{p}' "$0"         | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -557,3 +561,17 @@ echo "    Transcript source: ${TRANSCRIPT_SOURCE}"
 [[ -n "$SUMMARY_FILE" ]] && echo "    Summary          : ${SUMMARY_FILE}"
 echo "    All outputs      : ${OUTPUT_DIR}"
 echo "    Elapsed time     : ${ELAPSED_MIN}m ${ELAPSED_SEC}s"
+
+# ─── Launch markdown editor (optional) ───────────────────────────────────────
+
+if [[ -n "$SUMMARY_FILE" && -f "$SUMMARY_FILE" ]]; then
+    if command -v "$MARKDOWN_EDITOR" &>/dev/null 2>&1; then
+        echo ""
+        echo "==> Opening summary in ${MARKDOWN_EDITOR}..."
+        "$MARKDOWN_EDITOR" "$SUMMARY_FILE" &
+    else
+        echo ""
+        echo "==> Note: Markdown editor '${MARKDOWN_EDITOR}' not found — skipping auto-open."
+        echo "          Set MARKDOWN_EDITOR env var or install ghostwriter to enable this feature."
+    fi
+fi

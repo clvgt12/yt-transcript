@@ -50,8 +50,65 @@ OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",         "")
 FORCE_LOCAL_SUMMARY = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
 FORCE_WHISPER       = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
 POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
+CACHE_FILE_AGE_DAYS = int(os.environ.get("CACHE_FILE_AGE_DAYS", "30"))
 
 FILES_BASE.mkdir(parents=True, exist_ok=True)
+
+# ─── Cache management ─────────────────────────────────────────────────────────
+
+def purge_expired_cache():
+    """Remove video output directories older than CACHE_FILE_AGE_DAYS."""
+    if CACHE_FILE_AGE_DAYS <= 0:
+        return  # 0 = disabled
+    cutoff = time.time() - (CACHE_FILE_AGE_DAYS * 86400)
+    purged = 0
+    for entry in FILES_BASE.iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        # Use the most recent mtime among all files in the directory
+        mtimes = [f.stat().st_mtime for f in entry.rglob("*") if f.is_file()]
+        if not mtimes:
+            continue
+        newest_mtime = max(mtimes)
+        if newest_mtime < cutoff:
+            import shutil
+            shutil.rmtree(entry, ignore_errors=True)
+            log.info("Cache purged (expired): %s", entry.name)
+            purged += 1
+    if purged:
+        log.info("Cache purge complete: %d director%s removed.", purged, "y" if purged == 1 else "ies")
+
+
+def find_cached_job(video_id: str) -> dict:
+    """
+    Check if a completed job exists in cache for this video_id.
+    Returns dict with keys: transcript_path, html_path, transcript, summary_html
+    or empty dict if no usable cache entry exists.
+    """
+    out_dir = FILES_BASE / video_id
+    if not out_dir.is_dir():
+        return {}
+
+    txts  = [f for f in out_dir.glob("*.txt") if f.is_file()]
+    htmls = [f for f in out_dir.glob("*.html") if f.is_file()]
+
+    if not txts:
+        return {}
+
+    result = {
+        "transcript_path": txts[0],
+        "transcript":      txts[0].read_text(encoding="utf-8"),
+        "html_path":       None,
+        "summary_html":    None,
+    }
+
+    if htmls:
+        html_content = htmls[0].read_text(encoding="utf-8")
+        result["html_path"]    = htmls[0]
+        result["summary_html"] = html_content
+
+    return result
+
 
 # ─── Job class ────────────────────────────────────────────────────────────────
 
@@ -230,10 +287,23 @@ def run_workflow(job: Job):
         txt_path  = out_dir / f"{safe_title}.txt"
         html_path = out_dir / f"{safe_title}.html"
 
+        # ── Cache hit check ───────────────────────────────────────────────────
+        cached = find_cached_job(video_id)
+        if cached and cached.get("summary_html") and not FORCE_WHISPER:
+            job.log("Cache hit — reusing existing transcript and summary.")
+            job.log(f"Transcript : {cached['transcript_path'].name}")
+            job.log(f"Summary    : {cached['html_path'].name}")
+            job.summary_html = cached["summary_html"]
+            elapsed = int(time.time() - t_start)
+            job.log(f"Done (from cache). Elapsed: {elapsed // 60}m {elapsed % 60}s")
+            job.status      = "done"
+            job.finished_at = datetime.utcnow().isoformat()
+            return
+
         # ── Transcription ─────────────────────────────────────────────────────
         transcript_source = "cached"
 
-        if txt_path.exists():
+        if txt_path.exists() and not FORCE_WHISPER:
             job.log(f"Transcript cached: {txt_path.name}")
             transcript = txt_path.read_text(encoding="utf-8")
         elif not FORCE_WHISPER:
@@ -386,6 +456,11 @@ def main():
     render_css()
     st.title("🎬 YouTube Transcribe & Summarize")
 
+    # ── Cache purge on session startup (once per session) ───────────────────────
+    if "cache_purged" not in st.session_state:
+        purge_expired_cache()
+        st.session_state.cache_purged = True
+
     # ── Initialise session state ───────────────────────────────────────────────
     if "job" not in st.session_state:
         st.session_state.job = None
@@ -448,7 +523,6 @@ def main():
         else:
             st.success("✅ Transcription complete. No summary was produced.")
         if st.button("🔄 Transcribe another video"):
-            st.session_state.input_counter += 1  # new key → new widget instance → empty value
             st.session_state.job = None
             st.rerun()
 

@@ -81,6 +81,7 @@ services:
       FORCE_LOCAL_SUMMARY:  ${FORCE_LOCAL_SUMMARY:-false}
       # UI
       POLL_INTERVAL_MS:     ${POLL_INTERVAL_MS:-2000}
+      CACHE_FILE_AGE_DAYS:  ${CACHE_FILE_AGE_DAYS:-30}
     deploy:
       resources:
         reservations:

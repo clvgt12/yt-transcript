@@ -65,6 +65,7 @@ ENV OLLAMA_CLOUD_URL=https://ollama.com/api
 ENV OLLAMA_CLOUD_MODEL=gpt-oss:120b
 ENV FORCE_LOCAL_SUMMARY=false
 ENV FORCE_WHISPER=false
+ENV CACHE_FILE_AGE_DAYS=30
 ENV POLL_INTERVAL_MS=2000
 
 # ─── Port ─────────────────────────────────────────────────────────────────────

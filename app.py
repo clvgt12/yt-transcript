@@ -180,10 +180,13 @@ def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str
         <!DOCTYPE html><html lang="en"><head>
         <meta charset="UTF-8"><title>{title}</title>
         <style>
-          body{{font-family:Georgia,serif;max-width:860px;margin:2rem auto;
+          body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
+               Helvetica,Arial,sans-serif;max-width:860px;margin:2rem auto;
                padding:0 1.5rem;line-height:1.7;color:#222}}
-          h1{{font-size:1.6rem;border-bottom:2px solid #ccc;padding-bottom:.4rem}}
-          h2{{font-size:1.2rem;margin-top:2rem;color:#333}}
+          h1{{font-family:Georgia,'Times New Roman',serif;font-size:1.6rem;
+              border-bottom:2px solid #ccc;padding-bottom:.4rem}}
+          h2{{font-family:Georgia,'Times New Roman',serif;font-size:1.2rem;
+              margin-top:2rem;color:#333}}
           ul{{padding-left:1.4rem}} li{{margin-bottom:.4rem}}
           .meta{{font-size:.85rem;color:#666;margin-bottom:1.5rem}}
           hr{{border:none;border-top:1px solid #ddd;margin:1.5rem 0}}
@@ -371,9 +374,10 @@ def render_css():
                padding:1.5rem 2rem;margin-bottom:1.5rem}
     .output-div{background:#fff;border:1px solid #dee2e6;border-radius:8px;
                 padding:1.5rem 2rem;min-height:120px}
-    .log-box{background:#1e1e1e;color:#d4d4d4;font-family:'Courier New',monospace;
+    .log-box{background:#0a0a0a;color:#00ff00;font-family:'Courier New',monospace;
              font-size:.82rem;line-height:1.5;padding:1rem;border-radius:6px;
-             max-height:320px;overflow-y:auto;white-space:pre-wrap}
+             max-height:320px;overflow-y:auto;white-space:pre-wrap;
+             font-weight:bold;text-shadow:0 0 5px rgba(0,255,0,0.5)}
     </style>""", unsafe_allow_html=True)
 
 
@@ -389,11 +393,27 @@ def main():
     # ── INPUT DIV ─────────────────────────────────────────────────────────────
     st.markdown('<div class="input-div">', unsafe_allow_html=True)
     st.markdown("#### Input")
-    with st.form("transcribe_form"):
-        yt_url    = st.text_input("YouTube URL",
-                                   placeholder="https://www.youtube.com/watch?v=...")
-        submitted = st.form_submit_button("▶  Submit", use_container_width=True)
+    # Counter-based key forces widget re-instantiation on clear, resetting its value
+    if "input_counter" not in st.session_state:
+        st.session_state.input_counter = 0
+
+    with st.form("transcribe_form", clear_on_submit=False):
+        yt_url = st.text_input(
+            "YouTube URL",
+            key=f"yt_url_input_{st.session_state.input_counter}",
+            placeholder="https://www.youtube.com/watch?v=...",
+        )
+        col_submit, col_clear = st.columns([3, 1])
+        with col_submit:
+            submitted = st.form_submit_button("▶  Submit", use_container_width=True)
+        with col_clear:
+            cleared = st.form_submit_button("✕  Clear", use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
+
+    if cleared:
+        st.session_state.input_counter += 1  # new key → new widget instance → empty value
+        st.session_state.job = None
+        st.rerun()
 
     # Handle submission — create Job, store in session_state, start thread
     if submitted and yt_url.strip():

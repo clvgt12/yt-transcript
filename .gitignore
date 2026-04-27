@@ -1,0 +1,2 @@
+# Local environment — contains API keys, never commit
+.env

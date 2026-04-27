@@ -1,0 +1,466 @@
+"""
+yt-transcribe-web — Streamlit web interface for YouTube transcription + summarization
+
+Job state lives entirely in st.session_state so it survives Streamlit reruns
+within the same browser session. The background worker thread updates the
+job object in-place; the UI reads it on every poll cycle.
+"""
+
+import os
+import re
+import sys
+import uuid
+import logging
+import threading
+import subprocess
+import textwrap
+import time
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import streamlit as st
+import markdown as md_lib
+import requests
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("yt-transcribe-web")
+
+# ─── Configuration from environment ──────────────────────────────────────────
+
+FILES_BASE          = Path(os.environ.get("FILES_BASE",         "/usr/app/files"))
+YT_DLP_BIN          = os.environ.get("YT_DLP_BIN",             "/usr/local/bin/yt-dlp")
+VENV_PATH           = os.environ.get("VENV_PATH",              "/venv")
+WHISPER_MODEL       = os.environ.get("WHISPER_MODEL",          "small")
+GPU_MODELS          = os.environ.get("GPU_MODELS",             "tiny base small").split()
+SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() == "true"
+OLLAMA_MODEL        = os.environ.get("OLLAMA_MODEL",           "qwen3:1.7b")
+OLLAMA_URL          = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
+OLLAMA_CLOUD_URL    = os.environ.get("OLLAMA_CLOUD_URL",       "https://ollama.com/api")
+OLLAMA_CLOUD_MODEL  = os.environ.get("OLLAMA_CLOUD_MODEL",     "gpt-oss:120b")
+OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",         "")
+FORCE_LOCAL_SUMMARY = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
+FORCE_WHISPER       = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
+POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
+
+FILES_BASE.mkdir(parents=True, exist_ok=True)
+
+# ─── Job class ────────────────────────────────────────────────────────────────
+
+class Job:
+    """
+    Mutable job object stored directly in st.session_state["job"].
+    Background thread updates it in-place; UI reads it on every poll rerun.
+    Thread-safe via a simple Lock on log appends.
+    """
+    def __init__(self, job_id: str, url: str):
+        self.job_id      = job_id
+        self.url         = url
+        self.status      = "queued"   # queued | running | done | failed
+        self.log_lines   = []
+        self.summary_html: Optional[str] = None
+        self.error: Optional[str] = None
+        self.started_at  = datetime.utcnow().isoformat()
+        self.finished_at: Optional[str] = None
+        self._lock       = threading.Lock()
+
+    def log(self, line: str):
+        with self._lock:
+            self.log_lines.append(line)
+        log.info("[%s] %s", self.job_id[:8], line)
+
+    def get_log(self) -> list:
+        with self._lock:
+            return list(self.log_lines)
+
+
+# ─── Workflow helpers ─────────────────────────────────────────────────────────
+
+def extract_video_id(url: str) -> Optional[str]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.lstrip("/").split("?")[0]
+    qs = urllib.parse.parse_qs(parsed.query)
+    return qs.get("v", [None])[0]
+
+
+def sanitize_title(title: str) -> str:
+    safe = re.sub(r"[^\w\s\-]", "", title)
+    safe = re.sub(r"\s+", "_", safe.strip())
+    return safe[:80]
+
+
+def vtt_to_text(vtt_path: Path) -> str:
+    raw = vtt_path.read_text(encoding="utf-8")
+    raw = re.sub(r"^WEBVTT[^\n]*\n.*?\n\n", "", raw, count=1, flags=re.DOTALL)
+    blocks = re.split(r"\n{2,}", raw)
+    sentences, para_breaks = [], set()
+    prev_line, prev_sent_end = None, False
+    for block in blocks:
+        if not block.strip():
+            continue
+        lines = block.strip().splitlines()
+        if lines and re.match(r"^\s*\d+\s*$", lines[0]):
+            lines = lines[1:]
+        if lines and re.match(r"\d{2}:\d{2}[\d:,.]+\s*-->\s*\d{2}:\d{2}", lines[0]):
+            lines = lines[1:]
+        if lines and lines[0].startswith("NOTE"):
+            continue
+        cleaned = []
+        for line in lines:
+            line = re.sub(r"<[^>]+>", "", line)
+            line = re.sub(r"&amp;", "&", line).replace("&lt;","<").replace("&gt;",">").strip()
+            if line:
+                cleaned.append(line)
+        for line in cleaned:
+            if line == prev_line:
+                continue
+            sentences.append(line)
+            if prev_sent_end:
+                para_breaks.add(len(sentences) - 1)
+            prev_line = line
+            prev_sent_end = bool(re.search(r"[.!?]\s*$", line))
+    merged = []
+    for i, sent in enumerate(sentences):
+        if (merged and not re.search(r"[.!?,;:]\s*$", merged[-1])
+                and i not in para_breaks and sent[:1].islower()):
+            merged[-1] = merged[-1].rstrip() + " " + sent
+        else:
+            merged.append(sent)
+    paragraphs, current = [], []
+    for i, sent in enumerate(merged):
+        current.append(sent)
+        if (re.search(r"[.!?]\s*$", sent)
+                and i + 1 < len(merged) and merged[i + 1][:1].isupper()
+                and (i + 1) in para_breaks):
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return "\n\n".join(paragraphs)
+
+
+def build_prompt(transcript: str) -> str:
+    return textwrap.dedent(f"""
+        You are a professional analyst. Read the following transcript carefully and produce
+        a structured summary in Markdown format with exactly three sections:
+
+        ## Summary
+        Write a concise summary of 3-5 sentences covering the core subject and conclusions.
+
+        ## Key Points
+        Bullet list of the most important facts, arguments, or events from the transcript.
+
+        ## Takeaways
+        Bullet list of the key insights, implications, or action items a reader should walk away with.
+
+        Use clean Markdown formatting. Be precise and objective. Do not editorialize.
+
+        ---
+        TRANSCRIPT:
+        {transcript}
+    """).strip()
+
+
+def strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str) -> str:
+    body = md_lib.markdown(md_text, extensions=["extra", "nl2br"])
+    return textwrap.dedent(f"""
+        <!DOCTYPE html><html lang="en"><head>
+        <meta charset="UTF-8"><title>{title}</title>
+        <style>
+          body{{font-family:Georgia,serif;max-width:860px;margin:2rem auto;
+               padding:0 1.5rem;line-height:1.7;color:#222}}
+          h1{{font-size:1.6rem;border-bottom:2px solid #ccc;padding-bottom:.4rem}}
+          h2{{font-size:1.2rem;margin-top:2rem;color:#333}}
+          ul{{padding-left:1.4rem}} li{{margin-bottom:.4rem}}
+          .meta{{font-size:.85rem;color:#666;margin-bottom:1.5rem}}
+          hr{{border:none;border-top:1px solid #ddd;margin:1.5rem 0}}
+        </style></head><body>
+        <h1>{title}</h1>
+        <div class="meta">
+          <a href="{url}" target="_blank">{url}</a><br>
+          Transcribed via: {source} &mdash; Summarized with: {model}
+        </div><hr>{body}
+        </body></html>
+    """).strip()
+
+
+# ─── Background workflow ──────────────────────────────────────────────────────
+
+def run_workflow(job: Job):
+    """Full pipeline — mutates job object in place, read by UI via session_state."""
+    job.status = "running"
+    t_start = time.time()
+
+    try:
+        job.log("Resolving video metadata...")
+        video_id = extract_video_id(job.url)
+        if not video_id:
+            r = subprocess.run([YT_DLP_BIN, "--print", "id", job.url],
+                               capture_output=True, text=True)
+            video_id = r.stdout.strip()
+        if not video_id:
+            raise RuntimeError("Could not extract video ID.")
+
+        r2 = subprocess.run([YT_DLP_BIN, "--print", "title", job.url],
+                            capture_output=True, text=True)
+        video_title = r2.stdout.strip() or "unknown_title"
+        safe_title  = sanitize_title(video_title)
+
+        job.log(f"Video ID : {video_id}")
+        job.log(f"Title    : {video_title}")
+
+        out_dir = FILES_BASE / video_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        txt_path  = out_dir / f"{safe_title}.txt"
+        html_path = out_dir / f"{safe_title}.html"
+
+        # ── Transcription ─────────────────────────────────────────────────────
+        transcript_source = "cached"
+
+        if txt_path.exists():
+            job.log(f"Transcript cached: {txt_path.name}")
+            transcript = txt_path.read_text(encoding="utf-8")
+        elif not FORCE_WHISPER:
+            transcript = None
+            for sub_flag, label in [("--write-subs", "human"),
+                                     ("--write-auto-subs", "auto-generated")]:
+                job.log(f"Checking for {label} subtitles...")
+                subprocess.run([
+                    YT_DLP_BIN, "--skip-download", sub_flag,
+                    "--sub-lang", "en", "--sub-format", "vtt",
+                    "--output", str(out_dir / "%(title)s.%(ext)s"), job.url,
+                ], capture_output=True)
+                vtts = [f for f in out_dir.glob("*.en.vtt") if "live_chat" not in f.name]
+                if vtts:
+                    job.log(f"Found {label} subtitles.")
+                    transcript = vtt_to_text(vtts[0])
+                    vtts[0].unlink(missing_ok=True)
+                    txt_path.write_text(transcript, encoding="utf-8")
+                    transcript_source = f"youtube-{label.replace(' ', '-')}"
+                    break
+        else:
+            transcript = None
+
+        if transcript is None:
+            job.log("Using Whisper for transcription...")
+            mp3s = list(out_dir.glob("*.mp3"))
+            if not mp3s:
+                job.log("Downloading audio...")
+                subprocess.run([
+                    YT_DLP_BIN, "--extract-audio", "--audio-format", "mp3",
+                    "--audio-quality", "0",
+                    "--output", str(out_dir / "%(title)s.%(ext)s"), job.url,
+                ], capture_output=True)
+                mp3s = list(out_dir.glob("*.mp3"))
+            if not mp3s:
+                raise RuntimeError("Audio download failed.")
+            audio_path = mp3s[0]
+            device = "cuda" if WHISPER_MODEL in GPU_MODELS else "cpu"
+            job.log(f"Transcribing with Whisper '{WHISPER_MODEL}' on {device}...")
+            activate = Path(VENV_PATH) / "bin" / "activate"
+            cmd = (f"source {activate} && whisper '{audio_path}' "
+                   f"--model {WHISPER_MODEL} --device {device} "
+                   f"--output_dir '{out_dir}' --output_format txt --verbose False")
+            subprocess.run(cmd, shell=True, executable="/bin/bash", capture_output=True)
+            txts = list(out_dir.glob("*.txt"))
+            if not txts:
+                raise RuntimeError("Whisper produced no output.")
+            transcript = txts[0].read_text(encoding="utf-8")
+            txt_path = txts[0]
+            transcript_source = f"whisper-{WHISPER_MODEL}"
+
+        job.log(f"Transcript source: {transcript_source}")
+
+        # ── Summarization ─────────────────────────────────────────────────────
+        summary_md    = None
+        summary_model = "none"
+
+        if SUMMARIZE:
+            prompt = build_prompt(transcript)
+
+            # Cloud first
+            if not FORCE_LOCAL_SUMMARY and OLLAMA_API_KEY:
+                job.log(f"Attempting cloud summarization with '{OLLAMA_CLOUD_MODEL}'...")
+                try:
+                    resp = requests.post(
+                        f"{OLLAMA_CLOUD_URL}/generate",
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {OLLAMA_API_KEY}"},
+                        json={"model": OLLAMA_CLOUD_MODEL, "prompt": prompt,
+                              "stream": False, "think": False},
+                        timeout=120,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if "response" in data:
+                        summary_md    = strip_think(data["response"])
+                        summary_model = f"ollama-cloud:{OLLAMA_CLOUD_MODEL}"
+                        job.log("Cloud summarization succeeded.")
+                except Exception as exc:
+                    job.log(f"Cloud failed ({exc}) — trying local.")
+
+            # Local fallback
+            if summary_md is None:
+                job.log(f"Summarizing with local model '{OLLAMA_MODEL}'...")
+                for attempt in range(30):
+                    try:
+                        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+                        if r.status_code == 200:
+                            break
+                    except Exception:
+                        pass
+                    job.log(f"Waiting for Ollama API... ({attempt + 1}/30)")
+                    time.sleep(2)
+                try:
+                    resp = requests.post(
+                        f"{OLLAMA_URL}/api/generate",
+                        json={"model": OLLAMA_MODEL, "prompt": prompt,
+                              "stream": False, "think": False},
+                        timeout=300,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if "response" in data:
+                        summary_md    = strip_think(data["response"])
+                        summary_model = f"ollama-local:{OLLAMA_MODEL}"
+                except Exception as exc:
+                    job.log(f"Local summarization failed: {exc}")
+
+        # ── Write output files ────────────────────────────────────────────────
+        if summary_md:
+            html_content = markdown_to_html(
+                summary_md, video_title, job.url, transcript_source, summary_model)
+            html_path.write_text(html_content, encoding="utf-8")
+            job.summary_html = html_content
+            job.log(f"Summary saved: {html_path.name}")
+        else:
+            job.log("No summary produced.")
+
+        elapsed = int(time.time() - t_start)
+        job.log(f"Done. Elapsed: {elapsed // 60}m {elapsed % 60}s")
+        job.status      = "done"
+        job.finished_at = datetime.utcnow().isoformat()
+
+    except Exception as exc:
+        job.log(f"ERROR: {exc}")
+        job.error       = str(exc)
+        job.status      = "failed"
+        job.finished_at = datetime.utcnow().isoformat()
+        log.exception("Workflow failed for job %s", job.job_id)
+
+
+# ─── Streamlit UI ─────────────────────────────────────────────────────────────
+
+def render_css():
+    st.markdown("""<style>
+    .block-container{max-width:860px;padding-top:2rem}
+    .input-div{background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;
+               padding:1.5rem 2rem;margin-bottom:1.5rem}
+    .output-div{background:#fff;border:1px solid #dee2e6;border-radius:8px;
+                padding:1.5rem 2rem;min-height:120px}
+    .log-box{background:#1e1e1e;color:#d4d4d4;font-family:'Courier New',monospace;
+             font-size:.82rem;line-height:1.5;padding:1rem;border-radius:6px;
+             max-height:320px;overflow-y:auto;white-space:pre-wrap}
+    </style>""", unsafe_allow_html=True)
+
+
+def main():
+    st.set_page_config(page_title="YT Transcribe", page_icon="🎬", layout="centered")
+    render_css()
+    st.title("🎬 YouTube Transcribe & Summarize")
+
+    # ── Initialise session state ───────────────────────────────────────────────
+    if "job" not in st.session_state:
+        st.session_state.job = None
+
+    # ── INPUT DIV ─────────────────────────────────────────────────────────────
+    st.markdown('<div class="input-div">', unsafe_allow_html=True)
+    st.markdown("#### Input")
+    with st.form("transcribe_form"):
+        yt_url    = st.text_input("YouTube URL",
+                                   placeholder="https://www.youtube.com/watch?v=...")
+        submitted = st.form_submit_button("▶  Submit", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Handle submission — create Job, store in session_state, start thread
+    if submitted and yt_url.strip():
+        url = yt_url.strip()
+        if "youtube.com" not in url and "youtu.be" not in url:
+            st.error("Please enter a valid YouTube URL.")
+        else:
+            job = Job(str(uuid.uuid4()), url)
+            st.session_state.job = job          # store object, not just id
+            t = threading.Thread(
+                target=run_workflow, args=(job,),
+                daemon=True, name=f"worker-{job.job_id[:8]}"
+            )
+            t.start()
+            log.info("Job started: %s — %s", job.job_id, url)
+            st.rerun()
+
+    # ── OUTPUT DIV ────────────────────────────────────────────────────────────
+    st.markdown('<div class="output-div">', unsafe_allow_html=True)
+    st.markdown("#### Output")
+
+    job: Optional[Job] = st.session_state.get("job")
+
+    if job is None:
+        st.markdown(
+            '<p style="color:#888;font-style:italic;">Submit a YouTube URL above to begin.</p>',
+            unsafe_allow_html=True)
+
+    elif job.status == "done":
+        if job.summary_html:
+            st.components.v1.html(job.summary_html, height=600, scrolling=True)
+        else:
+            st.success("✅ Transcription complete. No summary was produced.")
+        if st.button("🔄 Transcribe another video"):
+            st.session_state.job = None
+            st.rerun()
+
+    elif job.status == "failed":
+        st.error(f"❌ Job failed: {job.error or 'Unknown error'}")
+        lines = job.get_log()
+        if lines:
+            st.markdown(
+                f'<div class="log-box">{"<br>".join(lines)}</div>',
+                unsafe_allow_html=True)
+        if st.button("🔄 Try again"):
+            st.session_state.job = None
+            st.rerun()
+
+    else:
+        # Queued or running — poll
+        label = "⏳ Running..." if job.status == "running" else "📋 Queued"
+        st.markdown(f'<p style="color:#0d6efd;font-weight:600">{label}</p>',
+                    unsafe_allow_html=True)
+        lines = job.get_log()
+        if lines:
+            st.markdown(
+                f'<div class="log-box">{"<br>".join(lines)}</div>',
+                unsafe_allow_html=True)
+        time.sleep(POLL_INTERVAL_MS / 1000)
+        st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown(
+        "<hr><p style='text-align:center;color:#aaa;font-size:.8rem;'>"
+        "yt-transcribe-web &mdash; kamakazi</p>",
+        unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()

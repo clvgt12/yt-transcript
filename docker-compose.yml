@@ -1,0 +1,101 @@
+# yt-transcribe-web — Docker Compose
+#
+# Services:
+#   ollama      — Ollama inference server (GPU-enabled, internal only)
+#   web         — Streamlit web application (port 8501)
+#
+# Internal network: yt-transcribe-net (ollama not exposed on host)
+#
+# Host mounts:
+#   ~/yt-transcribe/web/files    — transcription + summary output files
+#   ~/yt-transcribe/web/whisper  — Whisper model weight cache
+#   ollama Docker volume         — reuses existing cached Ollama models
+#
+# Usage:
+#   docker compose up -d --build
+#   open http://localhost:8501
+#
+# Environment:
+#   Create a .env file in this directory with:
+#     OLLAMA_API_KEY=your_key_here
+
+networks:
+  yt-transcribe-net:
+    driver: bridge
+
+services:
+
+  # ── Ollama inference server (internal only) ─────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: yt-transcribe-web-ollama
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    volumes:
+      - ollama:/root/.ollama        # Reuse existing ollama volume with cached models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # ── Streamlit web application ───────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yt-transcribe-web:latest
+    container_name: yt-transcribe-web-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - yt-transcribe-net
+    ports:
+      - "8501:8501"
+    volumes:
+      - ${HOME}/yt-transcribe/web/files:/usr/app/files
+      - ${HOME}/yt-transcribe/web/whisper:/root/.cache/whisper
+    environment:
+      # Transcription
+      WHISPER_MODEL:        ${WHISPER_MODEL:-small}
+      GPU_MODELS:           ${GPU_MODELS:-tiny base small}
+      FORCE_WHISPER:        ${FORCE_WHISPER:-false}
+      # Summarization
+      SUMMARIZE:            ${SUMMARIZE:-true}
+      OLLAMA_MODEL:         ${OLLAMA_MODEL:-qwen3:1.7b}
+      OLLAMA_URL:           http://ollama:11434
+      OLLAMA_CLOUD_URL:     https://ollama.com/api
+      OLLAMA_CLOUD_MODEL:   ${OLLAMA_CLOUD_MODEL:-gpt-oss:120b}
+      OLLAMA_API_KEY:       ${OLLAMA_API_KEY:-}
+      FORCE_LOCAL_SUMMARY:  ${FORCE_LOCAL_SUMMARY:-false}
+      # UI
+      POLL_INTERVAL_MS:     ${POLL_INTERVAL_MS:-2000}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8501/_stcore/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  ollama:
+    external: true              # Reuse existing ollama Docker volume

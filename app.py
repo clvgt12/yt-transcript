@@ -448,6 +448,7 @@ def main():
         else:
             st.success("✅ Transcription complete. No summary was produced.")
         if st.button("🔄 Transcribe another video"):
+            st.session_state.input_counter += 1  # new key → new widget instance → empty value
             st.session_state.job = None
             st.rerun()
 

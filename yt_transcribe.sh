@@ -426,7 +426,7 @@ if [[ "$SUMMARIZE" == "true" ]]; then
     TRANSCRIPT_TEXT=$(cat "$TRANSCRIPT_FILE")
     SUMMARY_FILE="${OUTPUT_DIR}/${SAFE_TITLE}_summary.md"
 
-    PROMPT="You are a professional analyst. Read the following transcript carefully and produce a structured summary in Markdown format with exactly three sections:
+    PROMPT="You are a professional analyst. Read the following transcript carefully and produce a structured summary in Markdown format with exactly four sections:
 
 ## Summary
 Write a concise summary of 3-5 sentences covering the core subject and conclusions.
@@ -436,6 +436,13 @@ Bullet list of the most important facts, arguments, or events from the transcrip
 
 ## Takeaways
 Bullet list of the key insights, implications, or action items a reader should walk away with.
+
+## Title Alignment
+Evaluate how well the transcript content aligns with the video title: \"${VIDEO_TITLE}\"
+Answer the following:
+- **Alignment verdict**: Choose one: Strongly aligned | Partially aligned | Weakly aligned | Misleading
+- **Explanation**: 1-3 sentences explaining your verdict. Cite specific evidence from the transcript.
+- **What the transcript actually covers**: One sentence describing the real subject matter if it differs from the title.
 
 Use clean Markdown formatting. Be precise and objective. Do not editorialize.
 
@@ -565,13 +572,13 @@ echo "    Elapsed time     : ${ELAPSED_MIN}m ${ELAPSED_SEC}s"
 # ─── Launch markdown editor (optional) ───────────────────────────────────────
 
 if [[ -n "$SUMMARY_FILE" && -f "$SUMMARY_FILE" ]]; then
-    if command -v "$MARKDOWN_EDITOR" &>/dev/null 2>&1; then
+    if command -v "$MARKDOWN_EDITOR" &>/dev/null; then
         echo ""
         echo "==> Opening summary in ${MARKDOWN_EDITOR}..."
         "$MARKDOWN_EDITOR" "$SUMMARY_FILE" &
     else
         echo ""
         echo "==> Note: Markdown editor '${MARKDOWN_EDITOR}' not found — skipping auto-open."
-        echo "          Set MARKDOWN_EDITOR env var or install ghostwriter to enable this feature."
+        echo "          Set MARKDOWN_EDITOR env var or install remarkable to enable this feature."
     fi
 fi

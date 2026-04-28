@@ -205,10 +205,22 @@ def vtt_to_text(vtt_path: Path) -> str:
     return "\n\n".join(paragraphs)
 
 
-def build_prompt(transcript: str) -> str:
+def build_prompt(transcript: str, title: str = "") -> str:
+    title_section = ""
+    if title:
+        title_section = f"""
+## Title Alignment
+Evaluate how well the transcript content aligns with the video title: "{title}"
+Answer the following:
+- **Alignment verdict**: Choose one: Strongly aligned | Partially aligned | Weakly aligned | Misleading
+- **Explanation**: 1-3 sentences explaining your verdict. Cite specific evidence from the transcript.
+- **What the transcript actually covers**: One sentence describing the real subject matter if it differs from the title.
+
+"""
+
     return textwrap.dedent(f"""
         You are a professional analyst. Read the following transcript carefully and produce
-        a structured summary in Markdown format with exactly three sections:
+        a structured summary in Markdown format with exactly {"four" if title else "three"} sections:
 
         ## Summary
         Write a concise summary of 3-5 sentences covering the core subject and conclusions.
@@ -218,7 +230,7 @@ def build_prompt(transcript: str) -> str:
 
         ## Takeaways
         Bullet list of the key insights, implications, or action items a reader should walk away with.
-
+        {title_section}
         Use clean Markdown formatting. Be precise and objective. Do not editorialize.
 
         ---
@@ -362,7 +374,7 @@ def run_workflow(job: Job):
         summary_model = "none"
 
         if SUMMARIZE:
-            prompt = build_prompt(transcript)
+            prompt = build_prompt(transcript, title=video_title)
 
             # Cloud first
             if not FORCE_LOCAL_SUMMARY and OLLAMA_API_KEY:

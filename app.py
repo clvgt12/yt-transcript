@@ -6,6 +6,7 @@ within the same browser session. The background worker thread updates the
 job object in-place; the UI reads it on every poll cycle.
 """
 
+import json
 import os
 import re
 import sys
@@ -110,6 +111,83 @@ def find_cached_job(video_id: str) -> dict:
     return result
 
 
+def save_chat_history(video_id: str, history: list):
+    """Persist chat history to <video_id>/chat_history.json."""
+    path = FILES_BASE / video_id / "chat_history.json"
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_chat_history(video_id: str) -> list:
+    """Load chat history from disk, return empty list if not found."""
+    path = FILES_BASE / video_id / "chat_history.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def chat_with_ollama(history: list, transcript: str, title: str) -> Optional[str]:
+    """
+    Send full conversation history to Ollama (cloud first, local fallback).
+    history: list of {role: user|assistant, content: str}
+    Returns assistant reply text or None on failure.
+    """
+    system_msg = textwrap.dedent(f"""
+        You are a helpful analyst assistant. The user is asking follow-up questions
+        about a YouTube video titled: "{title}"
+
+        The full transcript of the video is provided below for reference.
+        Answer questions precisely based on the transcript content.
+        If the answer is not in the transcript, say so clearly.
+
+        ---
+        TRANSCRIPT:
+        {transcript}
+    """).strip()
+
+    # Build messages array for /api/chat endpoint
+    messages = [{"role": "system", "content": system_msg}] + history
+
+    # Cloud first
+    if not FORCE_LOCAL_SUMMARY and OLLAMA_API_KEY:
+        try:
+            resp = requests.post(
+                f"{OLLAMA_CLOUD_URL}/chat",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {OLLAMA_API_KEY}"},
+                json={"model": OLLAMA_CLOUD_MODEL, "messages": messages,
+                      "stream": False, "think": False},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            reply = data.get("message", {}).get("content") or data.get("response")
+            if reply:
+                return strip_think(reply)
+        except Exception as exc:
+            log.warning("Cloud chat failed: %s — trying local.", exc)
+
+    # Local fallback
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={"model": OLLAMA_MODEL, "messages": messages,
+                  "stream": False, "think": False},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = data.get("message", {}).get("content") or data.get("response")
+        if reply:
+            return strip_think(reply)
+    except Exception as exc:
+        log.error("Local chat failed: %s", exc)
+
+    return None
+
+
 # ─── Job class ────────────────────────────────────────────────────────────────
 
 class Job:
@@ -119,15 +197,19 @@ class Job:
     Thread-safe via a simple Lock on log appends.
     """
     def __init__(self, job_id: str, url: str):
-        self.job_id      = job_id
-        self.url         = url
-        self.status      = "queued"   # queued | running | done | failed
-        self.log_lines   = []
+        self.job_id        = job_id
+        self.url           = url
+        self.status        = "queued"   # queued | running | done | failed
+        self.log_lines     = []
         self.summary_html: Optional[str] = None
         self.error: Optional[str] = None
-        self.started_at  = datetime.utcnow().isoformat()
+        self.started_at    = datetime.utcnow().isoformat()
         self.finished_at: Optional[str] = None
-        self._lock       = threading.Lock()
+        self.video_id: Optional[str] = None
+        self.video_title: Optional[str] = None
+        self.transcript: Optional[str] = None
+        self.chat_history: list = []      # [{role, content}, ...]
+        self._lock         = threading.Lock()
 
     def log(self, line: str):
         with self._lock:
@@ -293,6 +375,8 @@ def run_workflow(job: Job):
 
         job.log(f"Video ID : {video_id}")
         job.log(f"Title    : {video_title}")
+        job.video_id    = video_id
+        job.video_title = video_title
 
         out_dir = FILES_BASE / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -305,7 +389,13 @@ def run_workflow(job: Job):
             job.log("Cache hit — reusing existing transcript and summary.")
             job.log(f"Transcript : {cached['transcript_path'].name}")
             job.log(f"Summary    : {cached['html_path'].name}")
+            job.video_id     = video_id
+            job.video_title  = video_title
             job.summary_html = cached["summary_html"]
+            job.transcript   = cached["transcript"]
+            job.chat_history = load_chat_history(video_id)
+            if job.chat_history:
+                job.log(f"Chat history restored: {len(job.chat_history)} messages.")
             elapsed = int(time.time() - t_start)
             job.log(f"Done (from cache). Elapsed: {elapsed // 60}m {elapsed % 60}s")
             job.status      = "done"
@@ -368,6 +458,7 @@ def run_workflow(job: Job):
             transcript_source = f"whisper-{WHISPER_MODEL}"
 
         job.log(f"Transcript source: {transcript_source}")
+        job.transcript = transcript
 
         # ── Summarization ─────────────────────────────────────────────────────
         summary_md    = None
@@ -431,6 +522,7 @@ def run_workflow(job: Job):
             html_path.write_text(html_content, encoding="utf-8")
             job.summary_html = html_content
             job.log(f"Summary saved: {html_path.name}")
+            job.chat_history = load_chat_history(video_id)   # restore any prior chat
         else:
             job.log("No summary produced.")
 
@@ -534,6 +626,55 @@ def main():
             st.components.v1.html(job.summary_html, height=600, scrolling=True)
         else:
             st.success("✅ Transcription complete. No summary was produced.")
+
+        # ── Chat follow-up ─────────────────────────────────────────────────────
+        if job.transcript:
+            st.markdown("---")
+            st.markdown("#### 💬 Ask a follow-up question")
+
+            # Render existing chat history
+            if job.chat_history:
+                for msg in job.chat_history:
+                    role  = msg["role"]
+                    label = "**You:**" if role == "user" else "**Assistant:**"
+                    bg    = "#f0f4ff" if role == "user" else "#f8f9fa"
+                    st.markdown(
+                        f'<div style="background:{bg};border-radius:6px;'
+                        f'padding:.6rem 1rem;margin:.4rem 0;">'
+                        f'{label}<br>{msg["content"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # Chat input form
+            if "chat_counter" not in st.session_state:
+                st.session_state.chat_counter = 0
+
+            with st.form(f"chat_form_{st.session_state.chat_counter}"):
+                user_q = st.text_area(
+                    "Your question",
+                    placeholder="Ask anything about this video...",
+                    height=80,
+                    label_visibility="collapsed",
+                )
+                chat_submitted = st.form_submit_button("Send ➤", use_container_width=False)
+
+            if chat_submitted and user_q.strip():
+                with st.spinner("Thinking..."):
+                    job.chat_history.append({"role": "user", "content": user_q.strip()})
+                    reply = chat_with_ollama(
+                        job.chat_history, job.transcript,
+                        job.video_title or "this video"
+                    )
+                    if reply:
+                        job.chat_history.append({"role": "assistant", "content": reply})
+                        if job.video_id:
+                            save_chat_history(job.video_id, job.chat_history)
+                    else:
+                        job.chat_history.pop()   # remove unanswered user message
+                        st.error("Chat request failed. Please try again.")
+                st.session_state.chat_counter += 1
+                st.rerun()
+
         if st.button("🔄 Transcribe another video"):
             st.session_state.input_counter += 1  # new key → new widget instance → empty value
             st.session_state.job = None

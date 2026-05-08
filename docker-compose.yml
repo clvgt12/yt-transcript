@@ -65,7 +65,7 @@ services:
       - "8501:8501"
     volumes:
       - ${HOME}/yt-transcribe/web/files:/usr/app/files
-      - ${HOME}/yt-transcribe/web/whisper:/root/.cache/whisper
+      - ${HOME}/yt-transcribe/web/whisper:/home/ubuntu/.cache/whisper
     environment:
       # Transcription
       WHISPER_MODEL:        ${WHISPER_MODEL:-small}

@@ -41,16 +41,22 @@ WORKDIR /usr/app
 COPY app.py /usr/app/app.py
 
 # ─── Output directory ─────────────────────────────────────────────────────────
-RUN mkdir -p /usr/app/files
+RUN mkdir -p /usr/app/files && chown ubuntu:ubuntu /usr/app/files
 VOLUME ["/usr/app/files"]
 
 # ─── Whisper model cache ──────────────────────────────────────────────────────
-RUN mkdir -p /root/.cache/whisper
-VOLUME ["/root/.cache/whisper"]
+RUN mkdir -p /home/ubuntu/.cache/whisper && chown -R ubuntu:ubuntu /home/ubuntu/.cache
+VOLUME ["/home/ubuntu/.cache/whisper"]
 
 # ─── Streamlit config ─────────────────────────────────────────────────────────
-RUN mkdir -p /root/.streamlit
-COPY streamlit_config.toml /root/.streamlit/config.toml
+RUN mkdir -p /home/ubuntu/.streamlit && chown -R ubuntu:ubuntu /home/ubuntu/.streamlit
+COPY streamlit_config.toml /home/ubuntu/.streamlit/config.toml
+
+# ─── Set ownership of app and venv ────────────────────────────────────────────
+RUN chown -R ubuntu:ubuntu /usr/app /venv /home/ubuntu
+
+# ─── Switch to non-root user ──────────────────────────────────────────────────
+USER ubuntu
 
 # ─── Environment defaults ─────────────────────────────────────────────────────
 ENV FILES_BASE=/usr/app/files

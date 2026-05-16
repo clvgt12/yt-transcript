@@ -52,7 +52,7 @@ VOLUME ["/home/ubuntu/.cache/whisper"]
 RUN mkdir -p /home/ubuntu/.streamlit && chown -R ubuntu:ubuntu /home/ubuntu/.streamlit
 COPY streamlit_config.toml /home/ubuntu/.streamlit/config.toml
 
-# ─── Set ownership of app and venv ────────────────────────────────────────────
+# ─── Set ownership of all ubuntu-owned paths in one pass ─────────────────────
 RUN chown -R ubuntu:ubuntu /usr/app /venv /home/ubuntu
 
 # ─── Switch to non-root user ──────────────────────────────────────────────────
@@ -72,6 +72,8 @@ ENV OLLAMA_CLOUD_MODEL=gpt-oss:120b
 ENV FORCE_LOCAL_SUMMARY=false
 ENV FORCE_WHISPER=false
 ENV CACHE_FILE_AGE_DAYS=30
+ENV WEB_SEARCH_ENABLED=true
+ENV WEB_SEARCH_MAX_RESULTS=5
 ENV POLL_INTERVAL_MS=2000
 
 # ─── Port ─────────────────────────────────────────────────────────────────────

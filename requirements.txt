@@ -1,6 +1,5 @@
-# yt-transcribe-web Python dependencies
-#
-# PyTorch pinned to 2.2.0+cu118 — last build supporting NVIDIA Pascal (sm_61 / GTX 1050 Ti)
+# yt-transcribe-web Python dependencies — PyPI packages
+# PyTorch installed separately in Dockerfile from pytorch.org wheel index
 # numpy pinned below 2.0 — PyTorch 2.2.x compiled against NumPy 1.x C API
 
 numpy<2
@@ -8,3 +7,4 @@ openai-whisper
 streamlit>=1.35.0
 requests>=2.31.0
 markdown>=3.5.0
+duckduckgo-search>=6.0.0

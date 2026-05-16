@@ -8,6 +8,7 @@ job object in-place; the UI reads it on every poll cycle.
 
 import json
 import os
+import shutil
 import re
 import sys
 import uuid
@@ -51,9 +52,51 @@ OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",         "")
 FORCE_LOCAL_SUMMARY = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
 FORCE_WHISPER       = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
 POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
-CACHE_FILE_AGE_DAYS = int(os.environ.get("CACHE_FILE_AGE_DAYS", "30"))
+CACHE_FILE_AGE_DAYS    = int(os.environ.get("CACHE_FILE_AGE_DAYS",    "30"))
+WEB_SEARCH_ENABLED     = os.environ.get("WEB_SEARCH_ENABLED",     "true").lower() == "true"
+WEB_SEARCH_MAX_RESULTS = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
 
 FILES_BASE.mkdir(parents=True, exist_ok=True)
+
+# ─── Web search ───────────────────────────────────────────────────────────────
+
+def web_search(query: str, max_results: int = 5) -> list:
+    """
+    Search the web using DuckDuckGo. Returns list of result dicts:
+    [{title, href, body}, ...]
+    Returns empty list if search is disabled or fails.
+    """
+    if not WEB_SEARCH_ENABLED:
+        return []
+    try:
+        from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url":   r.get("href",  ""),
+                    "body":  r.get("body",  ""),
+                })
+        log.info("Web search '%s': %d results", query, len(results))
+        return results
+    except Exception as exc:
+        log.warning("Web search failed: %s", exc)
+        return []
+
+
+def format_search_results(results: list) -> str:
+    """Format search results as a readable context block for the LLM prompt."""
+    if not results:
+        return ""
+    lines = ["--- Web Search Results ---"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r['title']}")
+        lines.append(f"    URL: {r['url']}")
+        lines.append(f"    {r['body']}")
+        lines.append("")
+    return "\n".join(lines)
+
 
 # ─── Cache management ─────────────────────────────────────────────────────────
 
@@ -72,10 +115,13 @@ def purge_expired_cache():
             continue
         newest_mtime = max(mtimes)
         if newest_mtime < cutoff:
-            import shutil
-            shutil.rmtree(entry, ignore_errors=True)
-            log.info("Cache purged (expired): %s", entry.name)
-            purged += 1
+            try:
+                shutil.rmtree(entry)
+                log.info("Cache purged (expired): %s", entry.name)
+                purged += 1
+            except PermissionError:
+                log.warning("Cache purge skipped (permission denied): %s — "
+                            "run: sudo chown -R ubuntu:ubuntu %s", entry.name, entry)
     if purged:
         log.info("Cache purge complete: %d director%s removed.", purged, "y" if purged == 1 else "ies")
 
@@ -128,20 +174,33 @@ def load_chat_history(video_id: str) -> list:
         return []
 
 
-def chat_with_ollama(history: list, transcript: str, title: str) -> Optional[str]:
+def chat_with_ollama(history: list, transcript: str, title: str,
+                     search_results: list = None) -> Optional[str]:
     """
     Send full conversation history to Ollama (cloud first, local fallback).
     history: list of {role: user|assistant, content: str}
+    search_results: optional list of web search results to inject as context
     Returns assistant reply text or None on failure.
     """
+    search_context = ""
+    if search_results:
+        search_context = f"""
+The following web search results provide additional real-world context
+beyond the transcript. Use them to enrich your answer where relevant,
+and cite the source URL when drawing from them.
+
+{format_search_results(search_results)}
+"""
+
     system_msg = textwrap.dedent(f"""
-        You are a helpful analyst assistant. The user is asking follow-up questions
-        about a YouTube video titled: "{title}"
+        You are a helpful analyst assistant with access to web search results.
+        The user is asking follow-up questions about a YouTube video titled: "{title}"
 
         The full transcript of the video is provided below for reference.
-        Answer questions precisely based on the transcript content.
-        If the answer is not in the transcript, say so clearly.
-
+        Answer questions using both the transcript and any web search results provided.
+        Clearly distinguish between information from the transcript and from web sources.
+        If neither source contains the answer, say so clearly.
+        {search_context}
         ---
         TRANSCRIPT:
         {transcript}
@@ -659,11 +718,20 @@ def main():
                 chat_submitted = st.form_submit_button("Send ➤", use_container_width=False)
 
             if chat_submitted and user_q.strip():
-                with st.spinner("Thinking..."):
+                with st.spinner("Searching and thinking..."):
+                    # Run web search on the user question for additional context
+                    search_results = web_search(
+                        user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
+                    )
+                    if search_results:
+                        log.info("Injecting %d web results into chat context",
+                                 len(search_results))
+
                     job.chat_history.append({"role": "user", "content": user_q.strip()})
                     reply = chat_with_ollama(
                         job.chat_history, job.transcript,
-                        job.video_title or "this video"
+                        job.video_title or "this video",
+                        search_results=search_results,
                     )
                     if reply:
                         job.chat_history.append({"role": "assistant", "content": reply})

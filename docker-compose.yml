@@ -34,6 +34,8 @@ services:
       - yt-transcribe-net
     volumes:
       - ollama:/root/.ollama        # Reuse existing ollama volume with cached models
+    environment:
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
     deploy:
       resources:
         reservations:
@@ -82,6 +84,8 @@ services:
       # UI
       POLL_INTERVAL_MS:     ${POLL_INTERVAL_MS:-2000}
       CACHE_FILE_AGE_DAYS:  ${CACHE_FILE_AGE_DAYS:-30}
+      WEB_SEARCH_ENABLED:   ${WEB_SEARCH_ENABLED:-true}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
     deploy:
       resources:
         reservations:

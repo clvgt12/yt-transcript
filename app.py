@@ -47,7 +47,7 @@ SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() =
 OLLAMA_MODEL        = os.environ.get("OLLAMA_MODEL",           "qwen3:1.7b")
 OLLAMA_URL          = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
 OLLAMA_CLOUD_URL    = os.environ.get("OLLAMA_CLOUD_URL",       "https://ollama.com/api")
-OLLAMA_CLOUD_MODEL  = os.environ.get("OLLAMA_CLOUD_MODEL",     "gpt-oss:120b")
+OLLAMA_CLOUD_MODEL  = os.environ.get("OLLAMA_CLOUD_MODEL",     "gpt-oss:120b-cloud")
 OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",         "")
 FORCE_LOCAL_SUMMARY = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
 FORCE_WHISPER       = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
@@ -222,7 +222,7 @@ and cite the source URL when drawing from them.
                 headers={"Content-Type": "application/json",
                          "Authorization": f"Bearer {OLLAMA_API_KEY}"},
                 json={"model": OLLAMA_CLOUD_MODEL, "messages": messages,
-                      "stream": False, "think": False},
+                      "stream": False, "think": False, "thinking": False},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -540,7 +540,7 @@ def run_workflow(job: Job):
                         headers={"Content-Type": "application/json",
                                  "Authorization": f"Bearer {OLLAMA_API_KEY}"},
                         json={"model": OLLAMA_CLOUD_MODEL, "prompt": prompt,
-                              "stream": False, "think": False},
+                              "stream": False, "think": False, "thinking": False},
                         timeout=120,
                     )
                     resp.raise_for_status()

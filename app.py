@@ -44,13 +44,15 @@ VENV_PATH           = os.environ.get("VENV_PATH",              "/venv")
 WHISPER_MODEL       = os.environ.get("WHISPER_MODEL",          "small")
 GPU_MODELS          = os.environ.get("GPU_MODELS",             "tiny base small").split()
 SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() == "true"
-OLLAMA_MODEL        = os.environ.get("OLLAMA_MODEL",           "qwen3:1.7b")
-OLLAMA_URL          = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
-OLLAMA_CLOUD_URL    = os.environ.get("OLLAMA_CLOUD_URL",       "https://ollama.com/api")
-OLLAMA_CLOUD_MODEL  = os.environ.get("OLLAMA_CLOUD_MODEL",     "gpt-oss:120b-cloud")
-OLLAMA_API_KEY      = os.environ.get("OLLAMA_API_KEY",         "")
-FORCE_LOCAL_SUMMARY = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
-FORCE_WHISPER       = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
+OLLAMA_URL            = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
+OLLAMA_PRIMARY_MODEL  = os.environ.get("OLLAMA_PRIMARY_MODEL",   "gpt-oss:120b-cloud")
+OLLAMA_FALLBACK_MODEL = os.environ.get("OLLAMA_FALLBACK_MODEL",  "qwen3:1.7b")
+FORCE_LOCAL_SUMMARY   = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
+FORCE_WHISPER         = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
+
+def is_cloud_model(model_name: str) -> bool:
+    """Cloud models are identified by the -cloud suffix in their name."""
+    return model_name.endswith("-cloud")
 POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
 CACHE_FILE_AGE_DAYS    = int(os.environ.get("CACHE_FILE_AGE_DAYS",    "30"))
 WEB_SEARCH_ENABLED     = os.environ.get("WEB_SEARCH_ENABLED",     "true").lower() == "true"
@@ -211,44 +213,37 @@ and cite the source URL when drawing from them.
         {transcript}
     """).strip()
 
-    # Build messages array for /api/chat endpoint
     messages = [{"role": "system", "content": system_msg}] + history
 
-    # Cloud first
-    if not FORCE_LOCAL_SUMMARY and OLLAMA_API_KEY:
+    # Determine model sequence — cloud models proxied via local server
+    primary  = OLLAMA_PRIMARY_MODEL
+    fallback = OLLAMA_FALLBACK_MODEL
+    if FORCE_LOCAL_SUMMARY and is_cloud_model(primary):
+        models_to_try = [fallback]
+    else:
+        models_to_try = [primary, fallback] if primary != fallback else [primary]
+
+    for model in models_to_try:
+        cloud = is_cloud_model(model)
         try:
             resp = requests.post(
-                f"{OLLAMA_CLOUD_URL}/chat",
-                headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {OLLAMA_API_KEY}"},
-                json={"model": OLLAMA_CLOUD_MODEL, "messages": messages,
+                f"{OLLAMA_URL}/api/chat",
+                json={"model": model, "messages": messages,
                       "stream": False, "think": False, "thinking": False},
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
-            data = resp.json()
-            reply = data.get("message", {}).get("content") or data.get("response")
+            data     = resp.json()
+            reply    = data.get("message", {}).get("content") or data.get("response")
+            thinking = data.get("message", {}).get("thinking", "")
             if reply:
+                if thinking and thinking.strip() in reply:
+                    reply = reply.replace(thinking.strip(), "").strip()
                 return strip_think(reply)
         except Exception as exc:
-            log.warning("Cloud chat failed: %s — trying local.", exc)
+            log.warning("Chat failed with model '%s': %s", model, exc)
 
-    # Local fallback
-    try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": messages,
-                  "stream": False, "think": False},
-            timeout=300,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        reply = data.get("message", {}).get("content") or data.get("response")
-        if reply:
-            return strip_think(reply)
-    except Exception as exc:
-        log.error("Local chat failed: %s", exc)
-
+    log.error("All chat attempts failed.")
     return None
 
 
@@ -531,53 +526,48 @@ def run_workflow(job: Job):
         if SUMMARIZE:
             prompt = build_prompt(transcript, title=video_title)
 
-            # Cloud first
-            if not FORCE_LOCAL_SUMMARY and OLLAMA_API_KEY:
-                job.log(f"Attempting cloud summarization with '{OLLAMA_CLOUD_MODEL}'...")
+            # Wait for local Ollama to be ready
+            for attempt in range(30):
                 try:
-                    resp = requests.post(
-                        f"{OLLAMA_CLOUD_URL}/generate",
-                        headers={"Content-Type": "application/json",
-                                 "Authorization": f"Bearer {OLLAMA_API_KEY}"},
-                        json={"model": OLLAMA_CLOUD_MODEL, "prompt": prompt,
-                              "stream": False, "think": False, "thinking": False},
-                        timeout=120,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if "response" in data:
-                        summary_md    = strip_think(data["response"])
-                        summary_model = f"ollama-cloud:{OLLAMA_CLOUD_MODEL}"
-                        job.log("Cloud summarization succeeded.")
-                except Exception as exc:
-                    job.log(f"Cloud failed ({exc}) — trying local.")
+                    r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+                    if r.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                job.log(f"Waiting for Ollama API... ({attempt + 1}/30)")
+                time.sleep(2)
 
-            # Local fallback
-            if summary_md is None:
-                job.log(f"Summarizing with local model '{OLLAMA_MODEL}'...")
-                for attempt in range(30):
-                    try:
-                        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-                        if r.status_code == 200:
-                            break
-                    except Exception:
-                        pass
-                    job.log(f"Waiting for Ollama API... ({attempt + 1}/30)")
-                    time.sleep(2)
+            # Determine model sequence: primary first, fallback if primary fails
+            primary  = OLLAMA_PRIMARY_MODEL
+            fallback = OLLAMA_FALLBACK_MODEL
+            if FORCE_LOCAL_SUMMARY and is_cloud_model(primary):
+                job.log(f"FORCE_LOCAL_SUMMARY: skipping '{primary}', using '{fallback}'.")
+                models_to_try = [fallback]
+            else:
+                models_to_try = [primary, fallback] if primary != fallback else [primary]
+
+            for model in models_to_try:
+                cloud = is_cloud_model(model)
+                label = f"cloud model '{model}'" if cloud else f"local model '{model}'"
+                job.log(f"Summarizing with {label}...")
                 try:
                     resp = requests.post(
                         f"{OLLAMA_URL}/api/generate",
-                        json={"model": OLLAMA_MODEL, "prompt": prompt,
-                              "stream": False, "think": False},
+                        json={"model": model, "prompt": prompt,
+                              "stream": False, "think": False, "thinking": False},
                         timeout=300,
                     )
                     resp.raise_for_status()
                     data = resp.json()
                     if "response" in data:
                         summary_md    = strip_think(data["response"])
-                        summary_model = f"ollama-local:{OLLAMA_MODEL}"
+                        summary_model = f"{'ollama-cloud' if cloud else 'ollama-local'}:{model}"
+                        job.log(f"Summarization succeeded with {label}.")
+                        break
                 except Exception as exc:
-                    job.log(f"Local summarization failed: {exc}")
+                    job.log(f"Summarization failed with {label}: {exc}")
+                    if model == models_to_try[-1]:
+                        job.log("All summarization attempts failed.")
 
         # ── Write output files ────────────────────────────────────────────────
         if summary_md:

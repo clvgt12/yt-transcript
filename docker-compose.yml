@@ -17,7 +17,6 @@
 #
 # Environment:
 #   Create a .env file in this directory with:
-#     OLLAMA_API_KEY=your_key_here
 
 networks:
   yt-transcribe-net:
@@ -36,6 +35,7 @@ services:
       - ollama:/root/.ollama        # Reuse existing ollama volume with cached models
     environment:
       OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+      OLLAMA_NO_CLOUD:        ${OLLAMA_NO_CLOUD:-0}
     deploy:
       resources:
         reservations:
@@ -75,12 +75,10 @@ services:
       FORCE_WHISPER:        ${FORCE_WHISPER:-false}
       # Summarization
       SUMMARIZE:            ${SUMMARIZE:-true}
-      OLLAMA_MODEL:         ${OLLAMA_MODEL:-qwen3:1.7b}
-      OLLAMA_URL:           http://ollama:11434
-      OLLAMA_CLOUD_URL:     https://ollama.com/api
-      OLLAMA_CLOUD_MODEL:   ${OLLAMA_CLOUD_MODEL:-gpt-oss:120b}
-      OLLAMA_API_KEY:       ${OLLAMA_API_KEY:-}
-      FORCE_LOCAL_SUMMARY:  ${FORCE_LOCAL_SUMMARY:-false}
+      OLLAMA_URL:             http://ollama:11434
+      OLLAMA_PRIMARY_MODEL:   ${OLLAMA_PRIMARY_MODEL:-gpt-oss:120b-cloud}
+      OLLAMA_FALLBACK_MODEL:  ${OLLAMA_FALLBACK_MODEL:-qwen3:1.7b}
+      FORCE_LOCAL_SUMMARY:    ${FORCE_LOCAL_SUMMARY:-false}
       # UI
       POLL_INTERVAL_MS:     ${POLL_INTERVAL_MS:-2000}
       CACHE_FILE_AGE_DAYS:  ${CACHE_FILE_AGE_DAYS:-30}

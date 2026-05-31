@@ -29,10 +29,9 @@ RUN wget -q "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
 RUN python3 -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 
-# ─── PyTorch pinned to 2.2.0+cu118 (last build supporting Pascal/sm_61) ────────
-RUN pip install --no-cache-dir     torch==2.2.0+cu118     torchvision==0.17.0+cu118     torchaudio==2.2.0+cu118     --index-url https://download.pytorch.org/whl/cu118
 
-# ─── Remaining Python dependencies from PyPI ─────────────────────────────────
+# ─── Python dependencies from PyPI ───────────────────────────────────────────
+# Note: PyTorch and Whisper are in the whisper-service container, not here
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 

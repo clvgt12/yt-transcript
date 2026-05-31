@@ -1,0 +1,9 @@
+# whisper-service Python dependencies
+# PyTorch pinned to 2.2.0+cu118 — last build supporting Pascal/sm_61 (GTX 1050 Ti)
+# numpy pinned below 2.0 — PyTorch 2.2.x compiled against NumPy 1.x C API
+
+numpy<2
+openai-whisper
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

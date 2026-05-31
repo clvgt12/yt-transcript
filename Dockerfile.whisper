@@ -1,0 +1,61 @@
+# whisper-service Dockerfile
+# Base: nvidia/cuda 12.6 runtime on Ubuntu 24.04
+#   - Matches kamakazi host OS (Ubuntu 24.04 LTS)
+#   - Host driver 580.x / CUDA 13 supports any container CUDA <= 13
+#   - PyTorch cu118 bundles its own CUDA 11.8 libs internally — base image
+#     version does not need to match the PyTorch build suffix
+FROM nvidia/cuda:12.6.0-runtime-ubuntu24.04
+
+LABEL maintainer="chris@kamakazi"
+LABEL description="OpenAI Whisper transcription microservice (FastAPI + async)"
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ─── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Python virtual environment ───────────────────────────────────────────────
+RUN python3 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# ─── PyTorch — pinned to cu118 for Pascal/sm_61 compatibility ────────────────
+RUN pip install --no-cache-dir \
+    torch==2.2.0+cu118 \
+    torchvision==0.17.0+cu118 \
+    torchaudio==2.2.0+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# ─── Remaining Python dependencies from PyPI ─────────────────────────────────
+COPY whisper_requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+WORKDIR /app
+COPY whisper_service.py /app/whisper_service.py
+
+# ─── Whisper model cache directory ───────────────────────────────────────────
+RUN mkdir -p /whisper-cache
+VOLUME ["/whisper-cache"]
+
+# ─── Environment defaults ─────────────────────────────────────────────────────
+ENV WHISPER_MODEL=small
+ENV GPU_MODELS="tiny base small"
+ENV VENV_PATH=/venv
+ENV WHISPER_CACHE=/whisper-cache
+
+# ─── Port ─────────────────────────────────────────────────────────────────────
+EXPOSE 8000
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+CMD ["/venv/bin/uvicorn", "whisper_service:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1"]

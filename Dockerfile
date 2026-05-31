@@ -44,10 +44,6 @@ COPY app.py /usr/app/app.py
 RUN mkdir -p /usr/app/files && chown ubuntu:ubuntu /usr/app/files
 VOLUME ["/usr/app/files"]
 
-# ─── Whisper model cache ──────────────────────────────────────────────────────
-RUN mkdir -p /home/ubuntu/.cache/whisper && chown -R ubuntu:ubuntu /home/ubuntu/.cache
-VOLUME ["/home/ubuntu/.cache/whisper"]
-
 # ─── Streamlit config ─────────────────────────────────────────────────────────
 RUN mkdir -p /home/ubuntu/.streamlit && chown -R ubuntu:ubuntu /home/ubuntu/.streamlit
 COPY streamlit_config.toml /home/ubuntu/.streamlit/config.toml
@@ -61,7 +57,6 @@ USER ubuntu
 # ─── Environment defaults ─────────────────────────────────────────────────────
 ENV FILES_BASE=/usr/app/files
 ENV YT_DLP_BIN=/usr/local/bin/yt-dlp
-ENV VENV_PATH=/venv
 ENV WHISPER_MODEL=small
 ENV GPU_MODELS="tiny base small"
 ENV SUMMARIZE=true

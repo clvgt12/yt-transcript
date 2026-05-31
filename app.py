@@ -38,11 +38,11 @@ log = logging.getLogger("yt-transcribe-web")
 
 # ─── Configuration from environment ──────────────────────────────────────────
 
-FILES_BASE          = Path(os.environ.get("FILES_BASE",         "/usr/app/files"))
-YT_DLP_BIN          = os.environ.get("YT_DLP_BIN",             "/usr/local/bin/yt-dlp")
-VENV_PATH           = os.environ.get("VENV_PATH",              "/venv")
-WHISPER_MODEL       = os.environ.get("WHISPER_MODEL",          "small")
-GPU_MODELS          = os.environ.get("GPU_MODELS",             "tiny base small").split()
+FILES_BASE            = Path(os.environ.get("FILES_BASE",           "/usr/app/files"))
+YT_DLP_BIN            = os.environ.get("YT_DLP_BIN",               "/usr/local/bin/yt-dlp")
+WHISPER_MODEL         = os.environ.get("WHISPER_MODEL",            "small")
+WHISPER_SERVICE_URL   = os.environ.get("WHISPER_SERVICE_URL",      "http://whisper:8000")
+WHISPER_POLL_INTERVAL = int(os.environ.get("WHISPER_POLL_INTERVAL", "3"))
 SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() == "true"
 OLLAMA_URL            = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
 OLLAMA_PRIMARY_MODEL  = os.environ.get("OLLAMA_PRIMARY_MODEL",   "gpt-oss:120b-cloud")
@@ -489,7 +489,7 @@ def run_workflow(job: Job):
             transcript = None
 
         if transcript is None:
-            job.log("Using Whisper for transcription...")
+            job.log("Using Whisper transcription service...")
             mp3s = list(out_dir.glob("*.mp3"))
             if not mp3s:
                 job.log("Downloading audio...")
@@ -502,18 +502,43 @@ def run_workflow(job: Job):
             if not mp3s:
                 raise RuntimeError("Audio download failed.")
             audio_path = mp3s[0]
-            device = "cuda" if WHISPER_MODEL in GPU_MODELS else "cpu"
-            job.log(f"Transcribing with Whisper '{WHISPER_MODEL}' on {device}...")
-            activate = Path(VENV_PATH) / "bin" / "activate"
-            cmd = (f"source {activate} && whisper '{audio_path}' "
-                   f"--model {WHISPER_MODEL} --device {device} "
-                   f"--output_dir '{out_dir}' --output_format txt --verbose False")
-            subprocess.run(cmd, shell=True, executable="/bin/bash", capture_output=True)
-            txts = list(out_dir.glob("*.txt"))
-            if not txts:
-                raise RuntimeError("Whisper produced no output.")
-            transcript = txts[0].read_text(encoding="utf-8")
-            txt_path = txts[0]
+
+            # ── Submit to whisper-service ─────────────────────────────────────
+            job.log(f"Submitting audio to whisper-service (model: {WHISPER_MODEL})...")
+            with open(audio_path, "rb") as af:
+                resp = requests.post(
+                    f"{WHISPER_SERVICE_URL}/transcribe",
+                    files={"file": (audio_path.name, af, "audio/mpeg")},
+                    params={"model": WHISPER_MODEL},
+                    timeout=30,
+                )
+            resp.raise_for_status()
+            whisper_job_id = resp.json()["job_id"]
+            job.log(f"Whisper job submitted: {whisper_job_id[:8]}...")
+
+            # ── Poll for completion ───────────────────────────────────────────
+            while True:
+                time.sleep(WHISPER_POLL_INTERVAL)
+                poll = requests.get(
+                    f"{WHISPER_SERVICE_URL}/transcribe/{whisper_job_id}",
+                    timeout=10,
+                )
+                poll.raise_for_status()
+                data = poll.json()
+                status = data["status"]
+
+                if status == "running":
+                    job.log("Whisper transcription in progress...")
+                elif status == "done":
+                    transcript = data["transcript"]
+                    txt_path.write_text(transcript, encoding="utf-8")
+                    job.log(f"Whisper transcription complete.")
+                    break
+                elif status == "failed":
+                    raise RuntimeError(f"Whisper service failed: {data.get('error')}")
+                elif status == "queued":
+                    job.log("Whisper job queued, waiting...")
+
             transcript_source = f"whisper-{WHISPER_MODEL}"
 
         job.log(f"Transcript source: {transcript_source}")

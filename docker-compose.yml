@@ -2,13 +2,14 @@
 #
 # Services:
 #   ollama      — Ollama inference server (GPU-enabled, internal only)
+#   whisper     — Whisper transcription microservice (GPU-enabled, internal only)
 #   web         — Streamlit web application (port 8501)
 #
-# Internal network: yt-transcribe-net (ollama not exposed on host)
+# Internal network: yt-transcribe-net (ollama and whisper not exposed on host)
 #
 # Host mounts:
 #   ~/yt-transcribe/web/files    — transcription + summary output files
-#   ~/yt-transcribe/web/whisper  — Whisper model weight cache
+#   ~/.cache/whisper-service     — Whisper model weight cache (XDG convention)
 #   ollama Docker volume         — reuses existing cached Ollama models
 #
 # Usage:
@@ -50,6 +51,35 @@ services:
       retries: 12
       start_period: 30s
 
+  # ── Whisper transcription microservice ─────────────────────────────────────
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
+    image: yt-transcribe-whisper:latest
+    container_name: yt-transcribe-whisper
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    volumes:
+      - ${HOME}/.cache/whisper-service:/whisper-cache
+    environment:
+      WHISPER_MODEL:    ${WHISPER_MODEL:-small}
+      GPU_MODELS:       ${GPU_MODELS:-tiny base small}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
   # ── Streamlit web application ───────────────────────────────────────────────
   web:
     build:
@@ -61,18 +91,20 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+      whisper:
+        condition: service_healthy
     networks:
       - yt-transcribe-net
     ports:
       - "8501:8501"
     volumes:
       - ${HOME}/yt-transcribe/web/files:/usr/app/files
-      - ${HOME}/yt-transcribe/web/whisper:/home/ubuntu/.cache/whisper
     environment:
-      # Transcription
-      WHISPER_MODEL:        ${WHISPER_MODEL:-small}
-      GPU_MODELS:           ${GPU_MODELS:-tiny base small}
-      FORCE_WHISPER:        ${FORCE_WHISPER:-false}
+      # Transcription — handled by whisper-service container
+      WHISPER_MODEL:          ${WHISPER_MODEL:-small}
+      FORCE_WHISPER:          ${FORCE_WHISPER:-false}
+      WHISPER_SERVICE_URL:    http://whisper:8000
+      WHISPER_POLL_INTERVAL:  ${WHISPER_POLL_INTERVAL:-3}
       # Summarization
       SUMMARIZE:            ${SUMMARIZE:-true}
       OLLAMA_URL:             http://ollama:11434
@@ -84,13 +116,6 @@ services:
       CACHE_FILE_AGE_DAYS:  ${CACHE_FILE_AGE_DAYS:-30}
       WEB_SEARCH_ENABLED:   ${WEB_SEARCH_ENABLED:-true}
       WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8501/_stcore/health"]
       interval: 15s

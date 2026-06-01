@@ -50,6 +50,9 @@ ENV WHISPER_MODEL=small
 ENV GPU_MODELS="tiny base small"
 ENV VENV_PATH=/venv
 ENV WHISPER_CACHE=/whisper-cache
+# XDG_CACHE_HOME tells Whisper where to store downloaded model weights.
+# Must point to the host-mounted volume so weights persist across container restarts.
+ENV XDG_CACHE_HOME=/whisper-cache
 
 # ─── Port ─────────────────────────────────────────────────────────────────────
 EXPOSE 8000

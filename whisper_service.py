@@ -87,9 +87,11 @@ def transcribe_worker(job: Job, audio_path: Path):
         out_dir  = audio_path.parent
         activate = Path(VENV_PATH) / "bin" / "activate"
 
+        # XDG_CACHE_HOME controls where Whisper downloads and caches model weights.
+        # Setting it to WHISPER_CACHE ensures weights go to the host-mounted volume.
         cmd = (
             f"source {activate} && "
-            f"WHISPER_CACHE_DIR={WHISPER_CACHE} "
+            f"XDG_CACHE_HOME={WHISPER_CACHE} "
             f"whisper '{audio_path}' "
             f"--model {job.model} "
             f"--device {device} "

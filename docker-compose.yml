@@ -9,7 +9,7 @@
 #
 # Host mounts:
 #   ~/yt-transcribe/web/files    — transcription + summary output files
-#   ~/.cache/whisper-service     — Whisper model weight cache (XDG convention)
+#   ~/.cache                     — Whisper model weight cache (XDG_CACHE_HOME=/whisper-cache → whisper/*.pt)
 #   ollama Docker volume         — reuses existing cached Ollama models
 #
 # Usage:
@@ -62,7 +62,7 @@ services:
     networks:
       - yt-transcribe-net
     volumes:
-      - ${HOME}/.cache/whisper-service:/whisper-cache
+      - ${HOME}/.cache:/whisper-cache
     environment:
       WHISPER_MODEL:    ${WHISPER_MODEL:-small}
       GPU_MODELS:       ${GPU_MODELS:-tiny base small}

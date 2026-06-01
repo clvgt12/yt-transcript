@@ -701,114 +701,119 @@ def main():
             st.rerun()
 
     # ── OUTPUT DIV ────────────────────────────────────────────────────────────
-    st.markdown('<div class="output-div">', unsafe_allow_html=True)
+    st.markdown("""
+    <style>
+    [data-testid="stVerticalBlock"] div.output-container {
+        background:#ffffff;border:1px solid #dee2e6;border-radius:8px;
+        padding:1.5rem 2rem;min-height:120px;margin-top:0.5rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     st.markdown("#### Output")
+    output_container = st.container(border=True)
 
     job: Optional[Job] = st.session_state.get("job")
 
-    if job is None:
-        st.markdown(
-            '<p style="color:#888;font-style:italic;">Submit a YouTube URL above to begin.</p>',
-            unsafe_allow_html=True)
+    with output_container:
+        if job is None:
+            st.markdown(
+                '<p style="color:#888;font-style:italic;">Submit a YouTube URL above to begin.</p>',
+                unsafe_allow_html=True)
 
-    elif job.status == "done":
-        if job.summary_html:
-            st.components.v1.html(job.summary_html, height=600, scrolling=True)
-        else:
-            st.success("✅ Transcription complete. No summary was produced.")
+        elif job.status == "done":
+            if job.summary_html:
+                st.components.v1.html(job.summary_html, height=600, scrolling=True)
+            else:
+                st.success("✅ Transcription complete. No summary was produced.")
 
-        # ── Chat follow-up ─────────────────────────────────────────────────────
-        if job.transcript:
-            st.markdown("---")
-            st.markdown("#### 💬 Ask a follow-up question")
+            # ── Chat follow-up ─────────────────────────────────────────────────
+            if job.transcript:
+                st.markdown("---")
+                st.markdown("#### 💬 Ask a follow-up question")
 
-            # Render existing chat history
-            if job.chat_history:
-                for msg in job.chat_history:
-                    role    = msg["role"]
-                    label   = "**You:**" if role == "user" else "**Assistant:**"
-                    bg      = "#f0f4ff" if role == "user" else "#f8f9fa"
-                    # Convert Markdown to HTML so bold, bullets etc. render correctly
-                    body_html = md_lib.markdown(
-                        msg["content"], extensions=["extra", "nl2br"]
+                # Render existing chat history
+                if job.chat_history:
+                    for msg in job.chat_history:
+                        role      = msg["role"]
+                        bg        = "#f0f4ff" if role == "user" else "#f8f9fa"
+                        body_html = md_lib.markdown(
+                            msg["content"], extensions=["extra", "nl2br"]
+                        )
+                        label_html = "<strong>" + ("You:" if role == "user" else "Assistant:") + "</strong>"
+                        st.markdown(
+                            f'<div style="background:{bg};border-radius:6px;'
+                            f'padding:.6rem 1rem;margin:.4rem 0;">'
+                            f'{label_html}<br>{body_html}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                # Chat input form
+                if "chat_counter" not in st.session_state:
+                    st.session_state.chat_counter = 0
+
+                with st.form(f"chat_form_{st.session_state.chat_counter}"):
+                    user_q = st.text_area(
+                        "Your question",
+                        placeholder="Ask anything about this video...",
+                        height=80,
+                        label_visibility="collapsed",
                     )
-                    label_html = "<strong>" + ("You:" if role == "user" else "Assistant:") + "</strong>"
-                    st.markdown(
-                        f'<div style="background:{bg};border-radius:6px;'
-                        f'padding:.6rem 1rem;margin:.4rem 0;">'
-                        f'{label_html}<br>{body_html}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    chat_submitted = st.form_submit_button("Send ➤", use_container_width=False)
 
-            # Chat input form
-            if "chat_counter" not in st.session_state:
-                st.session_state.chat_counter = 0
+                if chat_submitted and user_q.strip():
+                    with st.spinner("Searching and thinking..."):
+                        search_results = web_search(
+                            user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
+                        )
+                        if search_results:
+                            log.info("Injecting %d web results into chat context",
+                                     len(search_results))
+                        job.chat_history.append({"role": "user", "content": user_q.strip()})
+                        reply = chat_with_ollama(
+                            job.chat_history, job.transcript,
+                            job.video_title or "this video",
+                            search_results=search_results,
+                        )
+                        if reply:
+                            job.chat_history.append({"role": "assistant", "content": reply})
+                            if job.video_id:
+                                save_chat_history(job.video_id, job.chat_history)
+                        else:
+                            job.chat_history.pop()
+                            st.error("Chat request failed. Please try again.")
+                    st.session_state.chat_counter += 1
+                    st.rerun()
 
-            with st.form(f"chat_form_{st.session_state.chat_counter}"):
-                user_q = st.text_area(
-                    "Your question",
-                    placeholder="Ask anything about this video...",
-                    height=80,
-                    label_visibility="collapsed",
-                )
-                chat_submitted = st.form_submit_button("Send ➤", use_container_width=False)
-
-            if chat_submitted and user_q.strip():
-                with st.spinner("Searching and thinking..."):
-                    # Run web search on the user question for additional context
-                    search_results = web_search(
-                        user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
-                    )
-                    if search_results:
-                        log.info("Injecting %d web results into chat context",
-                                 len(search_results))
-
-                    job.chat_history.append({"role": "user", "content": user_q.strip()})
-                    reply = chat_with_ollama(
-                        job.chat_history, job.transcript,
-                        job.video_title or "this video",
-                        search_results=search_results,
-                    )
-                    if reply:
-                        job.chat_history.append({"role": "assistant", "content": reply})
-                        if job.video_id:
-                            save_chat_history(job.video_id, job.chat_history)
-                    else:
-                        job.chat_history.pop()   # remove unanswered user message
-                        st.error("Chat request failed. Please try again.")
-                st.session_state.chat_counter += 1
+            if st.button("🔄 Transcribe another video"):
+                st.session_state.input_counter += 1
+                st.session_state.job = None
                 st.rerun()
 
-        if st.button("🔄 Transcribe another video"):
-            st.session_state.input_counter += 1  # new key → new widget instance → empty value
-            st.session_state.job = None
-            st.rerun()
-
-    elif job.status == "failed":
-        st.error(f"❌ Job failed: {job.error or 'Unknown error'}")
-        lines = job.get_log()
-        if lines:
-            st.markdown(
-                f'<div class="log-box">{"<br>".join(lines)}</div>',
-                unsafe_allow_html=True)
-        if st.button("🔄 Try again"):
-            st.session_state.job = None
-            st.rerun()
-
-    else:
-        # Queued or running — poll
-        label = "⏳ Running..." if job.status == "running" else "📋 Queued"
-        st.markdown(f'<p style="color:#0d6efd;font-weight:600">{label}</p>',
+        elif job.status == "failed":
+            st.error(f"❌ Job failed: {job.error or 'Unknown error'}")
+            lines = job.get_log()
+            if lines:
+                st.markdown(
+                    f'<div class="log-box">{"<br>".join(lines)}</div>',
                     unsafe_allow_html=True)
-        lines = job.get_log()
-        if lines:
-            st.markdown(
-                f'<div class="log-box">{"<br>".join(lines)}</div>',
-                unsafe_allow_html=True)
-        time.sleep(POLL_INTERVAL_MS / 1000)
-        st.rerun()
+            if st.button("🔄 Try again"):
+                st.session_state.job = None
+                st.rerun()
 
-    st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            # Queued or running — poll
+            label = "⏳ Running..." if job.status == "running" else "📋 Queued"
+            st.markdown(f'<p style="color:#0d6efd;font-weight:600">{label}</p>',
+                        unsafe_allow_html=True)
+            lines = job.get_log()
+            if lines:
+                st.markdown(
+                    f'<div class="log-box">{"<br>".join(lines)}</div>',
+                    unsafe_allow_html=True)
+            time.sleep(POLL_INTERVAL_MS / 1000)
+            st.rerun()
+
     st.markdown(
         "<hr><p style='text-align:center;color:#aaa;font-size:.8rem;'>"
         "yt-transcribe-web &mdash; kamakazi</p>",

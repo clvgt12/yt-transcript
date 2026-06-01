@@ -201,11 +201,13 @@ and cite the source URL when drawing from them.
         IMPORTANT INSTRUCTIONS:
         - Respond directly with your answer. Do NOT narrate your search process,
           show intermediate reasoning steps, or describe what you are about to do.
-        - Do NOT write phrases like "Searching...", "Let me search...",
-          "Simulated result list:", or "Now answer." — go straight to the answer.
+        - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
+          "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
+        - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
+          or any bracketed source references in your response.
+        - Do NOT announce what sources you are consulting. Just answer.
         - Use both the transcript and any web search results provided.
-        - Clearly distinguish between information from the transcript and web sources.
-        - Cite source URLs when drawing from web search results.
+        - When citing a web source, include its URL inline in the text naturally.
         - If neither source contains the answer, say so clearly and concisely.
         {search_context}
         ---
@@ -381,7 +383,16 @@ Answer the following:
 
 
 def strip_think(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Strip <think> XML blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Strip 【citation】 markers used by gpt-oss models
+    text = re.sub(r"\u3010[^\u3011]{1,30}\u3011", "", text)
+    # Strip search narration lines that slip through prompt suppression
+    lines = text.splitlines()
+    lines = [l for l in lines if not re.match(
+        r"(?i)^(let.?s search|searching\.\.\.|\*\*answer\*\*:?\s*$)", l.strip()
+    )]
+    return "\n".join(lines).strip()
 
 
 def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str) -> str:

@@ -62,26 +62,75 @@ FILES_BASE.mkdir(parents=True, exist_ok=True)
 
 # ─── Web search ───────────────────────────────────────────────────────────────
 
+def _url_reachable(url: str, timeout: int = 5) -> bool:
+    """
+    Validate a URL by attempting an HTTP GET with a short timeout.
+    Returns True if the server responds with a 2xx or 3xx status code.
+    """
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; yt-transcribe-web)"},
+            stream=True,          # don't download body — just check headers
+        )
+        resp.close()
+        reachable = resp.status_code < 400
+        if not reachable:
+            log.debug("URL rejected (HTTP %d): %s", resp.status_code, url)
+        return reachable
+    except Exception as exc:
+        log.debug("URL unreachable (%s): %s", exc, url)
+        return False
+
+
 def web_search(query: str, max_results: int = 5) -> list:
     """
-    Search the web using DuckDuckGo. Returns list of result dicts:
-    [{title, href, body}, ...]
+    Search the web using DuckDuckGo.
+    Each candidate URL is validated with a lightweight HTTP GET before inclusion.
+    Fetches up to max_results * 3 candidates from DDG to allow for rejects,
+    but caps total HTTP validation attempts to avoid infinite loops.
+
+    Returns list of validated result dicts: [{title, url, body}, ...]
     Returns empty list if search is disabled or fails.
     """
     if not WEB_SEARCH_ENABLED:
         return []
+
+    MAX_CANDIDATES  = max_results * 3   # DDG fetch ceiling
+    MAX_VALIDATIONS = max_results * 4   # hard cap on HTTP attempts
+
     try:
         from duckduckgo_search import DDGS
-        results = []
+        validated   = []
+        attempts    = 0
+
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "url":   r.get("href",  ""),
-                    "body":  r.get("body",  ""),
-                })
-        log.info("Web search '%s': %d results", query, len(results))
-        return results
+            for r in ddgs.text(query, max_results=MAX_CANDIDATES):
+                if len(validated) >= max_results:
+                    break
+                if attempts >= MAX_VALIDATIONS:
+                    log.warning("Web search: validation attempt cap reached (%d)", attempts)
+                    break
+
+                url = r.get("href", "")
+                if not url:
+                    continue
+
+                attempts += 1
+                if _url_reachable(url):
+                    validated.append({
+                        "title": r.get("title", ""),
+                        "url":   url,
+                        "body":  r.get("body",  ""),
+                    })
+                    log.debug("URL accepted: %s", url)
+
+        log.info("Web search '%s': %d/%d results validated (of %d attempts)",
+                 query, len(validated), max_results, attempts)
+        return validated
+
     except Exception as exc:
         log.warning("Web search failed: %s", exc)
         return []

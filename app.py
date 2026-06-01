@@ -725,13 +725,18 @@ def main():
             # Render existing chat history
             if job.chat_history:
                 for msg in job.chat_history:
-                    role  = msg["role"]
-                    label = "**You:**" if role == "user" else "**Assistant:**"
-                    bg    = "#f0f4ff" if role == "user" else "#f8f9fa"
+                    role    = msg["role"]
+                    label   = "**You:**" if role == "user" else "**Assistant:**"
+                    bg      = "#f0f4ff" if role == "user" else "#f8f9fa"
+                    # Convert Markdown to HTML so bold, bullets etc. render correctly
+                    body_html = md_lib.markdown(
+                        msg["content"], extensions=["extra", "nl2br"]
+                    )
+                    label_html = "<strong>" + ("You:" if role == "user" else "Assistant:") + "</strong>"
                     st.markdown(
                         f'<div style="background:{bg};border-radius:6px;'
                         f'padding:.6rem 1rem;margin:.4rem 0;">'
-                        f'{label}<br>{msg["content"]}</div>',
+                        f'{label_html}<br>{body_html}</div>',
                         unsafe_allow_html=True,
                     )
 

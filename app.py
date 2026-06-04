@@ -53,6 +53,13 @@ FORCE_WHISPER         = os.environ.get("FORCE_WHISPER",          "false").lower(
 def is_cloud_model(model_name: str) -> bool:
     """Cloud models are identified by the -cloud suffix in their name."""
     return model_name.endswith("-cloud")
+
+def has_native_web_search(model_name: str) -> bool:
+    """
+    Returns True for models with built-in web search capability.
+    gpt-oss models have native internet access — no need to inject DDG results.
+    """
+    return model_name.startswith("gpt-oss")
 POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
 CACHE_FILE_AGE_DAYS    = int(os.environ.get("CACHE_FILE_AGE_DAYS",    "30"))
 WEB_SEARCH_ENABLED     = os.environ.get("WEB_SEARCH_ENABLED",     "true").lower() == "true"
@@ -233,8 +240,14 @@ def chat_with_ollama(history: list, transcript: str, title: str,
     search_results: optional list of web search results to inject as context
     Returns assistant reply text or None on failure.
     """
+    # Determine active model — first in list is what will actually be used
+    active_model = OLLAMA_PRIMARY_MODEL
+    if FORCE_LOCAL_SUMMARY and is_cloud_model(OLLAMA_PRIMARY_MODEL):
+        active_model = OLLAMA_FALLBACK_MODEL
+
     search_context = ""
-    if search_results:
+    if search_results and not has_native_web_search(active_model):
+        # Only inject DDG results for models without built-in web search
         search_context = f"""
 The following web search results provide additional real-world context
 beyond the transcript. Use them to enrich your answer where relevant,
@@ -243,26 +256,50 @@ and cite the source URL when drawing from them.
 {format_search_results(search_results)}
 """
 
-    system_msg = textwrap.dedent(f"""
-        You are a helpful analyst assistant with access to web search results.
-        The user is asking follow-up questions about a YouTube video titled: "{title}"
+    if has_native_web_search(active_model):
+        # Model has built-in web search — instruct it to use that capability
+        system_msg = textwrap.dedent(f"""
+            You are a helpful analyst assistant with built-in web search capability.
+            The user is asking follow-up questions about a YouTube video titled: "{title}"
 
-        IMPORTANT INSTRUCTIONS:
-        - Respond directly with your answer. Do NOT narrate your search process,
-          show intermediate reasoning steps, or describe what you are about to do.
-        - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
-          "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
-        - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
-          or any bracketed source references in your response.
-        - Do NOT announce what sources you are consulting. Just answer.
-        - Use both the transcript and any web search results provided.
-        - When citing a web source, include its URL inline in the text naturally.
-        - If neither source contains the answer, say so clearly and concisely.
-        {search_context}
-        ---
-        TRANSCRIPT:
-        {transcript}
-    """).strip()
+            IMPORTANT INSTRUCTIONS:
+            - Respond directly with your answer. Do NOT narrate your search process,
+              show intermediate reasoning steps, or describe what you are about to do.
+            - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
+              "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
+            - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
+              or any bracketed source references in your response.
+            - Use your native web search to find current information when needed.
+            - Use the transcript below as the primary context for questions about the video.
+            - When citing a web source, include its URL inline in the text naturally.
+            - If the answer is not in the transcript or on the web, say so clearly.
+
+            ---
+            TRANSCRIPT:
+            {transcript}
+        """).strip()
+    else:
+        # Model has no native web search — inject DDG results as context
+        system_msg = textwrap.dedent(f"""
+            You are a helpful analyst assistant with access to web search results.
+            The user is asking follow-up questions about a YouTube video titled: "{title}"
+
+            IMPORTANT INSTRUCTIONS:
+            - Respond directly with your answer. Do NOT narrate your search process,
+              show intermediate reasoning steps, or describe what you are about to do.
+            - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
+              "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
+            - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
+              or any bracketed source references in your response.
+            - Do NOT announce what sources you are consulting. Just answer.
+            - Use both the transcript and any web search results provided.
+            - When citing a web source, include its URL inline in the text naturally.
+            - If neither source contains the answer, say so clearly and concisely.
+            {search_context}
+            ---
+            TRANSCRIPT:
+            {transcript}
+        """).strip()
 
     messages = [{"role": "system", "content": system_msg}] + history
 
@@ -690,7 +727,8 @@ def render_css():
     .log-box{background:#0a0a0a;color:#00ff00;font-family:'Courier New',monospace;
              font-size:.82rem;line-height:1.5;padding:1rem;border-radius:6px;
              max-height:320px;overflow-y:auto;white-space:pre-wrap;
-             font-weight:bold;text-shadow:0 0 5px rgba(0,255,0,0.5)}
+             font-weight:bold;text-shadow:0 0 5px rgba(0,255,0,0.5);
+             margin-bottom:1rem}
     </style>""", unsafe_allow_html=True)
 
 
@@ -812,12 +850,20 @@ def main():
 
                 if chat_submitted and user_q.strip():
                     with st.spinner("Searching and thinking..."):
-                        search_results = web_search(
-                            user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
-                        )
-                        if search_results:
-                            log.info("Injecting %d web results into chat context",
-                                     len(search_results))
+                        # Only run DDG for models without native web search
+                        _active = OLLAMA_PRIMARY_MODEL
+                        if FORCE_LOCAL_SUMMARY and is_cloud_model(OLLAMA_PRIMARY_MODEL):
+                            _active = OLLAMA_FALLBACK_MODEL
+                        if has_native_web_search(_active):
+                            search_results = []
+                            log.info("Skipping DDG — '%s' has native web search", _active)
+                        else:
+                            search_results = web_search(
+                                user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
+                            )
+                            if search_results:
+                                log.info("Injecting %d web results into chat context",
+                                         len(search_results))
                         job.chat_history.append({"role": "user", "content": user_q.strip()})
                         reply = chat_with_ollama(
                             job.chat_history, job.transcript,

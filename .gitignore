@@ -1,2 +1,3 @@
 # Local environment — contains API keys, never commit
 .env
+ping-ollama-model.sh

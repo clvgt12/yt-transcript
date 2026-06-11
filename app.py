@@ -540,10 +540,8 @@ def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str
           body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
                Helvetica,Arial,sans-serif;max-width:860px;margin:2rem auto;
                padding:0 1.5rem;line-height:1.7;color:#222}}
-          h1{{font-family:Georgia,'Times New Roman',serif;font-size:1.6rem;
-              border-bottom:2px solid #ccc;padding-bottom:.4rem}}
-          h2{{font-family:Georgia,'Times New Roman',serif;font-size:1.2rem;
-              margin-top:2rem;color:#333}}
+          h1{{font-size:1.6rem;border-bottom:2px solid #ccc;padding-bottom:.4rem}}
+          h2{{font-size:1.2rem;margin-top:2rem;color:#333}}
           ul{{padding-left:1.4rem}} li{{margin-bottom:.4rem}}
           .meta{{font-size:.85rem;color:#666;margin-bottom:1.5rem}}
           hr{{border:none;border-top:1px solid #ddd;margin:1.5rem 0}}

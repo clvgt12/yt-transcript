@@ -35,7 +35,7 @@ services:
     volumes:
       - ollama:/root/.ollama        # Reuse existing ollama volume with cached models
     environment:
-      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-24576}
       OLLAMA_NO_CLOUD:        ${OLLAMA_NO_CLOUD:-0}
     deploy:
       resources:

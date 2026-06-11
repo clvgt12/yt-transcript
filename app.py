@@ -156,6 +156,54 @@ def format_search_results(results: list) -> str:
     return "\n".join(lines)
 
 
+def clean_response(text: str) -> str:
+    """
+    Use the local fallback model to strip reasoning preamble from LLM responses.
+    Targets bleed-through like "Searching web...", "Search results...",
+    "Let me look that up..." that precede the actual answer.
+    Only invoked when the response appears to contain such preamble.
+    """
+    # Quick check — only run the cleanup pass if preamble indicators are present
+    preamble_patterns = [
+        "searching", "search results", "let me look",
+        "let me check", "looking up", "fetching",
+    ]
+    lower = text.lower()
+    if not any(p in lower[:300] for p in preamble_patterns):
+        return text
+
+    log.info("Response preamble detected — running cleanup pass via local model")
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model":  OLLAMA_FALLBACK_MODEL,
+                "prompt": (
+                    "The following text is an AI assistant response that begins with "
+                    "unwanted reasoning narration such as 'Searching...', "
+                    "'Search results...', 'Let me look that up...', or similar phrases "
+                    "before giving the actual answer.\n\n"
+                    "Remove ONLY the leading reasoning/searching narration and return "
+                    "the clean answer. Do not alter, summarize, or add to the answer "
+                    "content itself. Return only the cleaned response text.\n\n"
+                    f"TEXT TO CLEAN:\n{text}"
+                ),
+                "stream": False,
+                "think":  False,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        cleaned = strip_think(resp.json().get("response", text))
+        if cleaned and len(cleaned) > 50:
+            log.info("Cleanup pass complete — %d → %d chars", len(text), len(cleaned))
+            return cleaned
+    except Exception as exc:
+        log.warning("Cleanup pass failed: %s — returning original", exc)
+
+    return text
+
+
 # ─── Cache management ─────────────────────────────────────────────────────────
 
 def purge_expired_cache():
@@ -327,7 +375,9 @@ and cite the source URL when drawing from them.
             if reply:
                 if thinking and thinking.strip() in reply:
                     reply = reply.replace(thinking.strip(), "").strip()
-                return strip_think(reply)
+                reply = strip_think(reply)
+                reply = clean_response(reply)
+                return reply
         except Exception as exc:
             log.warning("Chat failed with model '%s': %s", model, exc)
 

@@ -165,8 +165,8 @@ def clean_response(text: str) -> str:
     """
     # Quick check — only run the cleanup pass if preamble indicators are present
     preamble_patterns = [
-        "searching", "search results", "let me look",
-        "let me check", "looking up", "fetching",
+        "search", "web", "look",
+        "check", "lookup", "fetch",
     ]
     lower = text.lower()
     if not any(p in lower[:300] for p in preamble_patterns):

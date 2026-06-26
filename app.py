@@ -18,7 +18,7 @@ import subprocess
 import textwrap
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Optional
 
@@ -400,7 +400,7 @@ class Job:
         self.log_lines     = []
         self.summary_html: Optional[str] = None
         self.error: Optional[str] = None
-        self.started_at    = datetime.utcnow().isoformat()
+        self.started_at    = datetime.now(UTC).isoformat()
         self.finished_at: Optional[str] = None
         self.video_id: Optional[str] = None
         self.video_title: Optional[str] = None
@@ -603,7 +603,7 @@ def run_workflow(job: Job):
             elapsed = int(time.time() - t_start)
             job.log(f"Done (from cache). Elapsed: {elapsed // 60}m {elapsed % 60}s")
             job.status      = "done"
-            job.finished_at = datetime.utcnow().isoformat()
+            job.finished_at = datetime.now(UTC).isoformat()
             return
 
         # ── Transcription ─────────────────────────────────────────────────────
@@ -753,13 +753,13 @@ def run_workflow(job: Job):
         elapsed = int(time.time() - t_start)
         job.log(f"Done. Elapsed: {elapsed // 60}m {elapsed % 60}s")
         job.status      = "done"
-        job.finished_at = datetime.utcnow().isoformat()
+        job.finished_at = datetime.now(UTC).isoformat()
 
     except Exception as exc:
         job.log(f"ERROR: {exc}")
         job.error       = str(exc)
         job.status      = "failed"
-        job.finished_at = datetime.utcnow().isoformat()
+        job.finished_at = datetime.now(UTC).isoformat()
         log.exception("Workflow failed for job %s", job.job_id)
 
 
@@ -856,7 +856,7 @@ def main():
 
         elif job.status == "done":
             if job.summary_html:
-                st.components.v1.html(job.summary_html, height=600, scrolling=True)
+                st.iframe(job.summary_html, height=600)
             else:
                 st.success("✅ Transcription complete. No summary was produced.")
 

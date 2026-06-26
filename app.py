@@ -795,7 +795,6 @@ def main():
         st.session_state.job = None
 
     # ── INPUT DIV ─────────────────────────────────────────────────────────────
-    st.markdown('<div class="input-div">', unsafe_allow_html=True)
     st.markdown("#### Input")
     # Counter-based key forces widget re-instantiation on clear, resetting its value
     if "input_counter" not in st.session_state:
@@ -812,7 +811,6 @@ def main():
             submitted = st.form_submit_button("▶  Submit", use_container_width=True)
         with col_clear:
             cleared = st.form_submit_button("✕  Clear", use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
     if cleared:
         st.session_state.input_counter += 1  # new key → new widget instance → empty value

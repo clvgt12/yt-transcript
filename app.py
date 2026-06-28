@@ -158,15 +158,18 @@ def format_search_results(results: list) -> str:
 
 def clean_response(text: str) -> str:
     """
-    Use the local fallback model to strip reasoning preamble from LLM responses.
-    Targets bleed-through like "Searching web...", "Search results...",
-    "Let me look that up..." that precede the actual answer.
+    Use the local fallback model to strip reasoning/tool-call preamble from
+    LLM responses. Targets bleed-through such as "Searching web...",
+    "Search results...", "Let me look that up...", and terse agentic
+    tool-call narration like "We'll open.Opening.Open link.Opening.Yes."
     Only invoked when the response appears to contain such preamble.
     """
     # Quick check — only run the cleanup pass if preamble indicators are present
     preamble_patterns = [
         "search", "web", "look",
         "check", "lookup", "fetch",
+        "open", "click", "navigat", "browsing", "browse",
+        "let me", "i'll", "i will", "we'll", "going to",
     ]
     lower = text.lower()
     if not any(p in lower[:300] for p in preamble_patterns):
@@ -180,12 +183,17 @@ def clean_response(text: str) -> str:
                 "model":  OLLAMA_FALLBACK_MODEL,
                 "prompt": (
                     "The following text is an AI assistant response that begins with "
-                    "unwanted reasoning narration such as 'Searching...', "
-                    "'Search results...', 'Let me look that up...', or similar phrases "
-                    "before giving the actual answer.\n\n"
-                    "Remove ONLY the leading reasoning/searching narration and return "
-                    "the clean answer. Do not alter, summarize, or add to the answer "
-                    "content itself. Return only the cleaned response text.\n\n"
+                    "unwanted internal dialog — reasoning, planning, or tool-call "
+                    "narration — before the actual answer. This includes things like "
+                    "'Searching...', 'Search results...', 'Let me look that up...', "
+                    "'We'll open.', 'Opening.', 'Open link.', 'Let me check...', "
+                    "or any other terse fragments describing actions the assistant is "
+                    "taking (browsing, clicking, navigating, fetching, thinking) rather "
+                    "than answering the question.\n\n"
+                    "Remove ONLY this leading internal-dialog narration and return "
+                    "the clean answer, starting from the first sentence that actually "
+                    "addresses the user's question. Do not alter, summarize, or add to "
+                    "the answer content itself. Return only the cleaned response text.\n\n"
                     f"TEXT TO CLEAN:\n{text}"
                 ),
                 "stream": False,
@@ -315,6 +323,9 @@ and cite the source URL when drawing from them.
               show intermediate reasoning steps, or describe what you are about to do.
             - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
               "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
+            - Do NOT narrate tool calls or browsing actions, e.g. "Opening.", "Open link.",
+              "We'll open.", "Clicking...", "Navigating to...", or similar fragments.
+              Use your tools silently and present only the final answer.
             - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
               or any bracketed source references in your response.
             - Use your native web search to find current information when needed.

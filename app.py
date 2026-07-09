@@ -549,7 +549,7 @@ def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str
         <meta charset="UTF-8"><title>{title}</title>
         <style>
           body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
-               Helvetica,Arial,sans-serif;max-width:860px;margin:2rem auto;
+               Helvetica,Arial,sans-serif;max-width:100%;margin:0;
                padding:0 1.5rem;line-height:1.7;color:#222}}
           h1{{font-size:1.6rem;border-bottom:2px solid #ccc;padding-bottom:.4rem}}
           h2{{font-size:1.2rem;margin-top:2rem;color:#333}}
@@ -840,7 +840,7 @@ def run_workflow(job: Job):
 
 def render_css():
     st.markdown("""<style>
-    .block-container{max-width:860px;padding-top:2rem}
+    .block-container{max-width:1400px;padding-top:2rem}
     .input-div{background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;
                padding:1.5rem 2rem;margin-bottom:1.5rem}
     .output-div{background:#fff;border:1px solid #dee2e6;border-radius:8px;
@@ -854,7 +854,7 @@ def render_css():
 
 
 def main():
-    st.set_page_config(page_title="YT Transcribe", page_icon="🎬", layout="centered")
+    st.set_page_config(page_title="YT Transcribe", page_icon="🎬", layout="wide")
     render_css()
     st.title("🎬 YouTube Transcribe & Summarize")
 

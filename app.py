@@ -566,6 +566,68 @@ def markdown_to_html(md_text: str, title: str, url: str, source: str, model: str
     """).strip()
 
 
+def transcript_to_html(transcript: str, title: str) -> str:
+    """Render plain transcript text as a scrollable HTML document."""
+    # Escape HTML special chars
+    escaped = (transcript
+               .replace("&", "&amp;")
+               .replace("<", "&lt;")
+               .replace(">", "&gt;"))
+    # Wrap paragraphs
+    paragraphs = "".join(
+        f"<p>{p.strip()}</p>" for p in escaped.split("\n\n") if p.strip()
+    )
+    return textwrap.dedent(f"""
+        <!DOCTYPE html><html lang="en"><head>
+        <meta charset="UTF-8"><title>Transcript — {title}</title>
+        <style>
+          body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
+               Helvetica,Arial,sans-serif;font-size:.85rem;line-height:1.7;
+               color:#333;margin:1rem 1.2rem;padding-bottom:1rem}}
+          h2{{font-size:1rem;color:#555;border-bottom:1px solid #eee;
+              padding-bottom:.3rem;margin-bottom:1rem}}
+          p{{margin:0 0 .8rem 0}}
+          #copy-btn{{
+            position:sticky;bottom:0;width:100%;padding:.5rem;
+            background:#0d6efd;color:#fff;border:none;border-radius:4px;
+            cursor:pointer;font-size:.85rem;font-weight:600;
+            box-shadow:0 -2px 6px rgba(0,0,0,0.15);
+          }}
+          #copy-btn:hover{{background:#0b5ed7}}
+          #copy-msg{{text-align:center;font-size:.75rem;color:#198754;
+                     height:1rem;margin-top:.2rem}}
+        </style></head><body>
+        <h2>📄 Transcript</h2>
+        <div id="transcript-text">{paragraphs}</div>
+        <button id="copy-btn" onclick="copyTranscript()">📋 Copy to Clipboard</button>
+        <div id="copy-msg"></div>
+        <script>
+        function copyTranscript() {{
+          const text = document.getElementById('transcript-text').innerText;
+          navigator.clipboard.writeText(text).then(function() {{
+            const msg = document.getElementById('copy-msg');
+            msg.textContent = '✅ Copied to clipboard';
+            setTimeout(() => msg.textContent = '', 2500);
+          }}).catch(function() {{
+            // Fallback for browsers that block clipboard in iframes
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            const msg = document.getElementById('copy-msg');
+            msg.textContent = '✅ Copied to clipboard';
+            setTimeout(() => msg.textContent = '', 2500);
+          }});
+        }}
+        </script>
+        </body></html>
+    """).strip()
+
+
 # ─── Background workflow ──────────────────────────────────────────────────────
 
 def run_workflow(job: Job):
@@ -866,8 +928,27 @@ def main():
                 unsafe_allow_html=True)
 
         elif job.status == "done":
-            if job.summary_html:
-                st.iframe(job.summary_html, height=600)
+            if job.summary_html or job.transcript:
+                # ── Two-column layout ─────────────────────────────────────────
+                col_left, col_right = st.columns([1, 2])
+
+                with col_left:
+                    if job.transcript:
+                        transcript_html = transcript_to_html(
+                            job.transcript,
+                            job.video_title or "Transcript"
+                        )
+                        st.iframe(transcript_html, height=600)
+                    else:
+                        st.markdown(
+                            '<p style="color:#888;font-style:italic;">No transcript available.</p>',
+                            unsafe_allow_html=True)
+
+                with col_right:
+                    if job.summary_html:
+                        st.iframe(job.summary_html, height=600)
+                    else:
+                        st.success("✅ Transcription complete. No summary was produced.")
             else:
                 st.success("✅ Transcription complete. No summary was produced.")
 

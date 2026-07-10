@@ -47,6 +47,7 @@ SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() =
 OLLAMA_URL            = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
 OLLAMA_PRIMARY_MODEL  = os.environ.get("OLLAMA_PRIMARY_MODEL",   "gpt-oss:120b-cloud")
 OLLAMA_FALLBACK_MODEL = os.environ.get("OLLAMA_FALLBACK_MODEL",  "qwen3:1.7b")
+OLLAMA_API_KEY        = os.environ.get("OLLAMA_API_KEY",         "")
 FORCE_LOCAL_SUMMARY   = os.environ.get("FORCE_LOCAL_SUMMARY",    "false").lower() == "true"
 FORCE_WHISPER         = os.environ.get("FORCE_WHISPER",          "false").lower() == "true"
 
@@ -56,16 +57,103 @@ def is_cloud_model(model_name: str) -> bool:
 
 def has_native_web_search(model_name: str) -> bool:
     """
-    Returns True for models with built-in web search capability.
-    gpt-oss models have native internet access — no need to inject DDG results.
+    Cloud models like gpt-oss use Ollama's tool API for web search.
+    Local models use DDG injection instead.
     """
-    return model_name.startswith("gpt-oss")
+    return is_cloud_model(model_name)
 POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS",   "2000"))
 CACHE_FILE_AGE_DAYS    = int(os.environ.get("CACHE_FILE_AGE_DAYS",    "30"))
 WEB_SEARCH_ENABLED     = os.environ.get("WEB_SEARCH_ENABLED",     "true").lower() == "true"
 WEB_SEARCH_MAX_RESULTS = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
 
 FILES_BASE.mkdir(parents=True, exist_ok=True)
+
+# ─── Ollama web_search / web_fetch tool definitions ──────────────────────────
+
+OLLAMA_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information on a query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 5).",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch the full content of a specific URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch content from."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    }
+]
+
+
+def execute_tool(tool_name: str, tool_args: dict) -> str:
+    """
+    Execute an Ollama cloud tool (web_search or web_fetch).
+    Routes to https://ollama.com/api/<tool_name> with OLLAMA_API_KEY auth.
+    Returns formatted string result for inclusion in tool message.
+    """
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
+    try:
+        resp = requests.post(
+            f"https://ollama.com/api/{tool_name}",
+            headers=headers,
+            json=tool_args,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if tool_name == "web_search":
+            results = data.get("results", [])
+            lines = []
+            for r in results:
+                lines.append(f"Title: {r.get('title', '')}")
+                lines.append(f"URL: {r.get('url', '')}")
+                lines.append(f"Content: {r.get('content', r.get('body', ''))[:500]}")
+                lines.append("")
+            return "\n".join(lines) or "No results found."
+
+        elif tool_name == "web_fetch":
+            content_text = data.get("content", data.get("text", ""))
+            # Cap at ~8000 chars to avoid context overflow
+            return content_text[:8000] if content_text else "No content retrieved."
+
+    except Exception as exc:
+        log.warning("Tool '%s' execution failed: %s", tool_name, exc)
+        return f"Error executing {tool_name}: {exc}"
+
+    return "No result."
+
 
 # ─── Web search ───────────────────────────────────────────────────────────────
 
@@ -109,7 +197,10 @@ def web_search(query: str, max_results: int = 5) -> list:
     MAX_VALIDATIONS = max_results * 4   # hard cap on HTTP attempts
 
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS          # new package name
+        except ImportError:
+            from duckduckgo_search import DDGS  # legacy name
         validated   = []
         attempts    = 0
 
@@ -121,21 +212,18 @@ def web_search(query: str, max_results: int = 5) -> list:
                     log.warning("Web search: validation attempt cap reached (%d)", attempts)
                     break
 
-                url = r.get("href", "")
+                url = r.get("href", "") or r.get("url", "")
                 if not url:
                     continue
+                validated.append({
+                    "title": r.get("title", ""),
+                    "url":   url,
+                    "body":  r.get("body", r.get("content", "")),
+                })
+                if len(validated) >= max_results:
+                    break
 
-                attempts += 1
-                if _url_reachable(url):
-                    validated.append({
-                        "title": r.get("title", ""),
-                        "url":   url,
-                        "body":  r.get("body",  ""),
-                    })
-                    log.debug("URL accepted: %s", url)
-
-        log.info("Web search '%s': %d/%d results validated (of %d attempts)",
-                 query, len(validated), max_results, attempts)
+        log.info("Web search '%s': %d results", query, len(validated))
         return validated
 
     except Exception as exc:
@@ -291,70 +379,61 @@ def load_chat_history(video_id: str) -> list:
 def chat_with_ollama(history: list, transcript: str, title: str,
                      search_results: list = None) -> Optional[str]:
     """
-    Send full conversation history to Ollama (cloud first, local fallback).
-    history: list of {role: user|assistant, content: str}
-    search_results: optional list of web search results to inject as context
-    Returns assistant reply text or None on failure.
+    Send conversation history to Ollama using the tools API with web_search
+    and web_fetch for all models. Executes a tool-call loop until the model
+    produces a final text answer. Falls back to OLLAMA_FALLBACK_MODEL on failure.
     """
-    # Determine active model — first in list is what will actually be used
-    active_model = OLLAMA_PRIMARY_MODEL
-    if FORCE_LOCAL_SUMMARY and is_cloud_model(OLLAMA_PRIMARY_MODEL):
-        active_model = OLLAMA_FALLBACK_MODEL
+    # Determine active model
+    primary  = OLLAMA_PRIMARY_MODEL
+    fallback = OLLAMA_FALLBACK_MODEL
+    if FORCE_LOCAL_SUMMARY and is_cloud_model(primary):
+        active_model = fallback
+    else:
+        active_model = primary
 
-    search_context = ""
-    if search_results and not has_native_web_search(active_model):
-        # Only inject DDG results for models without built-in web search
-        search_context = f"""
-The following web search results provide additional real-world context
-beyond the transcript. Use them to enrich your answer where relevant,
-and cite the source URL when drawing from them.
+    # For local models inject DDG results as context; cloud models use tools API
+    ddg_context = ""
+    if not has_native_web_search(active_model) and search_results:
+        ddg_context = f"""
+The following web search results provide additional context beyond the transcript.
+Use them to enrich your answer and cite source URLs where relevant.
 
 {format_search_results(search_results)}
 """
 
     if has_native_web_search(active_model):
-        # Model has built-in web search — instruct it to use that capability
         system_msg = textwrap.dedent(f"""
-            You are a helpful analyst assistant with built-in web search capability.
+            You are a helpful analyst assistant with access to web search tools.
             The user is asking follow-up questions about a YouTube video titled: "{title}"
 
             IMPORTANT INSTRUCTIONS:
-            - Respond directly with your answer. Do NOT narrate your search process,
-              show intermediate reasoning steps, or describe what you are about to do.
-            - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
-              "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
-            - Do NOT narrate tool calls or browsing actions, e.g. "Opening.", "Open link.",
-              "We'll open.", "Clicking...", "Navigating to...", or similar fragments.
-              Use your tools silently and present only the final answer.
-            - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
-              or any bracketed source references in your response.
-            - Use your native web search to find current information when needed.
-            - Use the transcript below as the primary context for questions about the video.
+            - Use the web_search and web_fetch tools to find current information when needed.
+            - Respond directly with your final answer. Do NOT narrate tool usage or
+              show intermediate reasoning steps in your response.
+            - Do NOT write phrases like "Searching...", "Let me search...", "Opening.",
+              "Fetching...", or similar process narration — go straight to the answer.
+            - Do NOT include citation markers like 【transcript】 or bracketed source references.
+            - Use the transcript below as primary context for questions about the video.
             - When citing a web source, include its URL inline in the text naturally.
-            - If the answer is not in the transcript or on the web, say so clearly.
+            - If neither the transcript nor web search contains the answer, say so clearly.
 
             ---
             TRANSCRIPT:
             {transcript}
         """).strip()
     else:
-        # Model has no native web search — inject DDG results as context
         system_msg = textwrap.dedent(f"""
             You are a helpful analyst assistant with access to web search results.
             The user is asking follow-up questions about a YouTube video titled: "{title}"
 
             IMPORTANT INSTRUCTIONS:
-            - Respond directly with your answer. Do NOT narrate your search process,
-              show intermediate reasoning steps, or describe what you are about to do.
-            - Do NOT write phrases like "Searching...", "Let me search...", "Let's search",
-              "Simulated result list:", "Now answer.", or "Answer:" — go straight to the answer.
-            - Do NOT include citation markers like 【transcript】, [transcript], 【source】,
-              or any bracketed source references in your response.
-            - Do NOT announce what sources you are consulting. Just answer.
-            - Use both the transcript and any web search results provided.
+            - Respond directly with your answer. Do NOT narrate your reasoning process.
+            - Do NOT write phrases like "Searching...", "Let me search...", or "Let's search".
+            - Do NOT include citation markers like 【transcript】 or bracketed source references.
+            - Use both the transcript and any web search results provided below.
             - When citing a web source, include its URL inline in the text naturally.
             - If neither source contains the answer, say so clearly and concisely.
-            {search_context}
+            {ddg_context}
             ---
             TRANSCRIPT:
             {transcript}
@@ -362,33 +441,99 @@ and cite the source URL when drawing from them.
 
     messages = [{"role": "system", "content": system_msg}] + history
 
-    # Determine model sequence — cloud models proxied via local server
-    primary  = OLLAMA_PRIMARY_MODEL
-    fallback = OLLAMA_FALLBACK_MODEL
+    # Model sequence
     if FORCE_LOCAL_SUMMARY and is_cloud_model(primary):
         models_to_try = [fallback]
     else:
         models_to_try = [primary, fallback] if primary != fallback else [primary]
 
     for model in models_to_try:
-        cloud = is_cloud_model(model)
         try:
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={"model": model, "messages": messages,
-                      "stream": False, "think": False, "thinking": False},
-                timeout=300,
-            )
-            resp.raise_for_status()
-            data     = resp.json()
-            reply    = data.get("message", {}).get("content") or data.get("response")
-            thinking = data.get("message", {}).get("thinking", "")
-            if reply:
-                if thinking and thinking.strip() in reply:
-                    reply = reply.replace(thinking.strip(), "").strip()
-                reply = strip_think(reply)
-                reply = clean_response(reply)
-                return reply
+            if has_native_web_search(model):
+                # ── Cloud model: use Ollama tools API loop ────────────────────
+                loop_messages = list(messages)
+                MAX_TOOL_ITERATIONS = 10
+                iteration = 0
+
+                while iteration < MAX_TOOL_ITERATIONS:
+                    iteration += 1
+                    headers = {"Content-Type": "application/json"}
+                    if OLLAMA_API_KEY:
+                        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+                    resp = requests.post(
+                        f"{OLLAMA_URL}/api/chat",
+                        headers=headers,
+                        json={
+                            "model":    model,
+                            "messages": loop_messages,
+                            "tools":    OLLAMA_TOOLS,
+                            "stream":   False,
+                            "think":    False,
+                            "thinking": False,
+                        },
+                        timeout=300,
+                    )
+                    resp.raise_for_status()
+                    data       = resp.json()
+                    msg        = data.get("message", {})
+                    tool_calls = msg.get("tool_calls", [])
+                    reply      = msg.get("content", "")
+
+                    if tool_calls:
+                        loop_messages.append({
+                            "role":       "assistant",
+                            "content":    reply or "",
+                            "tool_calls": tool_calls,
+                        })
+                        for tc in tool_calls:
+                            fn_name = tc.get("function", {}).get("name", "")
+                            fn_args = tc.get("function", {}).get("arguments", {})
+                            log.info("Executing tool: %s args=%s", fn_name, fn_args)
+                            tool_result = execute_tool(fn_name, fn_args)
+                            loop_messages.append({
+                                "role":      "tool",
+                                "content":   tool_result[:8000],
+                                "tool_name": fn_name,
+                            })
+                        continue
+
+                    if reply:
+                        thinking = msg.get("thinking", "")
+                        if thinking and thinking.strip() in reply:
+                            reply = reply.replace(thinking.strip(), "").strip()
+                        reply = strip_think(reply)
+                        reply = clean_response(reply)
+                        log.info("Chat complete with model '%s' (%d tool iterations)",
+                                 model, iteration - 1)
+                        return reply
+                    break
+
+            else:
+                # ── Local model: DDG results injected via system prompt ────────
+                resp = requests.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={
+                        "model":    model,
+                        "messages": messages,
+                        "stream":   False,
+                        "think":    False,
+                        "thinking": False,
+                    },
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                data  = resp.json()
+                msg   = data.get("message", {})
+                reply = msg.get("content", "")
+                if reply:
+                    thinking = msg.get("thinking", "")
+                    if thinking and thinking.strip() in reply:
+                        reply = reply.replace(thinking.strip(), "").strip()
+                    reply = strip_think(reply)
+                    reply = clean_response(reply)
+                    log.info("Chat complete with model '%s' (DDG context)", model)
+                    return reply
+
         except Exception as exc:
             log.warning("Chat failed with model '%s': %s", model, exc)
 
@@ -988,20 +1133,19 @@ def main():
 
                 if chat_submitted and user_q.strip():
                     with st.spinner("Searching and thinking..."):
-                        # Only run DDG for models without native web search
-                        _active = OLLAMA_PRIMARY_MODEL
-                        if FORCE_LOCAL_SUMMARY and is_cloud_model(OLLAMA_PRIMARY_MODEL):
-                            _active = OLLAMA_FALLBACK_MODEL
+                        # DDG search for local models; cloud models use tools API
+                        _active = OLLAMA_FALLBACK_MODEL if (
+                            FORCE_LOCAL_SUMMARY and is_cloud_model(OLLAMA_PRIMARY_MODEL)
+                        ) else OLLAMA_PRIMARY_MODEL
                         if has_native_web_search(_active):
                             search_results = []
-                            log.info("Skipping DDG — '%s' has native web search", _active)
                         else:
                             search_results = web_search(
                                 user_q.strip(), max_results=WEB_SEARCH_MAX_RESULTS
                             )
                             if search_results:
-                                log.info("Injecting %d web results into chat context",
-                                         len(search_results))
+                                log.info("DDG: %d results for local model '%s'",
+                                         len(search_results), _active)
                         job.chat_history.append({"role": "user", "content": user_q.strip()})
                         reply = chat_with_ollama(
                             job.chat_history, job.transcript,

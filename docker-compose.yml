@@ -37,6 +37,7 @@ services:
     environment:
       OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-24576}
       OLLAMA_NO_CLOUD:        ${OLLAMA_NO_CLOUD:-0}
+      OLLAMA_API_KEY:         ${OLLAMA_API_KEY:-}
     deploy:
       resources:
         reservations:
@@ -110,6 +111,7 @@ services:
       OLLAMA_URL:             http://ollama:11434
       OLLAMA_PRIMARY_MODEL:   ${OLLAMA_PRIMARY_MODEL:-gpt-oss:120b-cloud}
       OLLAMA_FALLBACK_MODEL:  ${OLLAMA_FALLBACK_MODEL:-qwen3:1.7b}
+      OLLAMA_API_KEY:         ${OLLAMA_API_KEY:-}
       FORCE_LOCAL_SUMMARY:    ${FORCE_LOCAL_SUMMARY:-false}
       # UI
       POLL_INTERVAL_MS:     ${POLL_INTERVAL_MS:-2000}

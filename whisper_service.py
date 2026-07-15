@@ -155,10 +155,12 @@ def watchdog():
       - No poll received in POLL_TIMEOUT_SECONDS (client disconnected /
         Streamlit Stop button pressed)
     """
-    log.info("Watchdog started (job_timeout=%ds, poll_timeout=%ds)",
-             JOB_TIMEOUT_SECONDS, POLL_TIMEOUT_SECONDS)
+    # Check interval = 1 polling cycle (derived directly from POLL_INTERVAL_MS)
+    check_interval = max(5, _POLL_INTERVAL_MS // 1000)
+    log.info("Watchdog started (job_timeout=%ds, poll_timeout=%ds, check_interval=%ds)",
+             JOB_TIMEOUT_SECONDS, POLL_TIMEOUT_SECONDS, check_interval)
     while True:
-        time.sleep(30)
+        time.sleep(check_interval)
         now = time.time()
         with _jobs_lock:
             jobs = list(_jobs.values())

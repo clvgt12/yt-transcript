@@ -176,13 +176,17 @@ def watchdog():
             if timed_out or abandoned:
                 reason = "timeout" if timed_out else "client disconnected"
                 log.warning("Watchdog killing job %s (%s)", job.job_id[:8], reason)
-                if job.process and job.process.poll() is None:
-                    job.process.kill()
-                    log.info("Subprocess killed for job %s", job.job_id[:8])
+                proc = job.process   # capture local ref to avoid race condition
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.kill()
+                        log.info("Subprocess killed for job %s", job.job_id[:8])
+                    except Exception as kill_exc:
+                        log.warning("Kill failed for job %s: %s", job.job_id[:8], kill_exc)
+                job.process     = None
                 job.status      = "failed"
                 job.error       = f"Job terminated by watchdog ({reason})"
                 job.finished_at = datetime.now(UTC).isoformat()
-                job.process     = None
 
 
 app = FastAPI(
@@ -262,6 +266,42 @@ async def transcribe(
         job_id=job_id,
         status="queued",
         message=f"Transcription started with model '{use_model}'",
+    )
+
+
+class CancelResponse(BaseModel):
+    job_id:  str
+    status:  str
+    message: str
+
+
+@app.delete("/transcribe/{job_id}", response_model=CancelResponse)
+def cancel_transcription(job_id: str):
+    """Cancel a queued or running transcription job."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if job.status not in ("queued", "running"):
+        return CancelResponse(
+            job_id=job_id,
+            status=job.status,
+            message=f"Job already in terminal state: {job.status}",
+        )
+    proc = job.process   # capture local ref to avoid race condition
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+            log.info("[%s] Cancelled by client request — subprocess killed", job_id[:8])
+        except Exception as kill_exc:
+            log.warning("[%s] Kill failed: %s", job_id[:8], kill_exc)
+    job.status      = "failed"
+    job.error       = "Cancelled by client"
+    job.finished_at = datetime.now(UTC).isoformat()
+    job.process     = None
+    return CancelResponse(
+        job_id=job_id,
+        status="failed",
+        message="Job cancelled",
     )
 
 

@@ -300,6 +300,27 @@ def clean_response(text: str) -> str:
     return text
 
 
+def cancel_whisper_job(job: "Job"):
+    """
+    Cancel the active whisper job if one is running.
+    Only fires during the whisper transcription phase (whisper_job_id is set).
+    """
+    if not job or not job.whisper_job_id:
+        return
+    try:
+        resp = requests.delete(
+            f"{WHISPER_SERVICE_URL}/transcribe/{job.whisper_job_id}",
+            timeout=5,
+        )
+        if resp.status_code in (200, 404):
+            log.info("Whisper job %s cancelled", job.whisper_job_id[:8])
+        else:
+            log.warning("Whisper cancel returned %d", resp.status_code)
+    except Exception as exc:
+        log.warning("Whisper cancel request failed: %s", exc)
+    job.whisper_job_id = None
+
+
 # ─── Cache management ─────────────────────────────────────────────────────────
 
 def purge_expired_cache():
@@ -562,6 +583,7 @@ class Job:
         self.video_title: Optional[str] = None
         self.transcript: Optional[str] = None
         self.chat_history: list = []      # [{role, content}, ...]
+        self.whisper_job_id: Optional[str] = None  # set during whisper phase only
         self._lock         = threading.Lock()
 
     def log(self, line: str):
@@ -876,16 +898,43 @@ def run_workflow(job: Job):
                     timeout=30,
                 )
             resp.raise_for_status()
-            whisper_job_id = resp.json()["job_id"]
+            whisper_job_id      = resp.json()["job_id"]
+            job.whisper_job_id  = whisper_job_id   # track for cancellation
             job.log(f"Whisper job submitted: {whisper_job_id[:8]}...")
 
             # ── Poll for completion ───────────────────────────────────────────
+            # Import Streamlit runtime for session liveness check
+            try:
+                from streamlit.runtime import get_instance
+                from streamlit.runtime.scriptrunner import get_script_run_ctx
+                _st_runtime = get_instance()
+                _st_ctx     = get_script_run_ctx()
+            except Exception:
+                _st_runtime = None
+                _st_ctx     = None
+
             while True:
                 time.sleep(WHISPER_POLL_INTERVAL)
+
+                # Stop polling if Streamlit session has ended (tab closed / Stop)
+                if _st_runtime and _st_ctx:
+                    try:
+                        if not _st_runtime.is_active_session(_st_ctx.session_id):
+                            job.log("Session ended — stopping whisper poll.")
+                            log.info("Session ended for job %s — stopping poll", job.job_id[:8])
+                            break
+                    except Exception:
+                        pass  # if check fails, continue polling
+
                 poll = requests.get(
                     f"{WHISPER_SERVICE_URL}/transcribe/{whisper_job_id}",
                     timeout=10,
                 )
+                # 404 means job was cancelled by client — exit poll loop cleanly
+                if poll.status_code == 404:
+                    log.info("Whisper job %s cancelled — stopping poll", whisper_job_id[:8])
+                    job.whisper_job_id = None
+                    return   # exit run_workflow entirely, job already cancelled
                 poll.raise_for_status()
                 data = poll.json()
                 status = data["status"]
@@ -895,10 +944,17 @@ def run_workflow(job: Job):
                 elif status == "done":
                     transcript = data["transcript"]
                     txt_path.write_text(transcript, encoding="utf-8")
+                    job.whisper_job_id = None   # whisper phase complete
                     job.log(f"Whisper transcription complete.")
                     break
                 elif status == "failed":
-                    raise RuntimeError(f"Whisper service failed: {data.get('error')}")
+                    # Check if cancelled by client (watchdog or DELETE)
+                    error = data.get("error", "")
+                    if "Cancelled by client" in error or "watchdog" in error.lower():
+                        log.info("Whisper job %s stopped: %s", whisper_job_id[:8], error)
+                        job.whisper_job_id = None
+                        return   # exit cleanly, no error state
+                    raise RuntimeError(f"Whisper service failed: {error}")
                 elif status == "queued":
                     job.log("Whisper job queued, waiting...")
 
@@ -1031,6 +1087,7 @@ def main():
             cleared = st.form_submit_button("✕  Clear", use_container_width=True)
 
     if cleared:
+        cancel_whisper_job(st.session_state.get("job"))
         st.session_state.input_counter += 1  # new key → new widget instance → empty value
         st.session_state.job = None
         st.rerun()
@@ -1163,6 +1220,7 @@ def main():
                     st.rerun()
 
             if st.button("🔄 Transcribe another video"):
+                cancel_whisper_job(st.session_state.get("job"))
                 st.session_state.input_counter += 1
                 st.session_state.job = None
                 st.rerun()

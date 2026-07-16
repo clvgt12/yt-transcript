@@ -302,23 +302,54 @@ def clean_response(text: str) -> str:
 
 def cancel_whisper_job(job: "Job"):
     """
-    Cancel the active whisper job if one is running.
-    Only fires during the whisper transcription phase (whisper_job_id is set).
+    Cancel any active processing on the job:
+    - Kills yt-dlp download subprocess and cleans up partial mp3 if downloading
+    - Sends DELETE to whisper service if whisper transcription is active
     """
-    if not job or not job.whisper_job_id:
+    if not job:
         return
-    try:
-        resp = requests.delete(
-            f"{WHISPER_SERVICE_URL}/transcribe/{job.whisper_job_id}",
-            timeout=5,
-        )
-        if resp.status_code in (200, 404):
-            log.info("Whisper job %s cancelled", job.whisper_job_id[:8])
-        else:
-            log.warning("Whisper cancel returned %d", resp.status_code)
-    except Exception as exc:
-        log.warning("Whisper cancel request failed: %s", exc)
-    job.whisper_job_id = None
+
+    # ── Kill yt-dlp download if active ───────────────────────────────────────
+    proc = job.ytdlp_process
+    if proc is not None:
+        try:
+            if proc.returncode is None:
+                proc.kill()
+                log.info("yt-dlp download killed for job %s", job.job_id[:8])
+        except Exception as exc:
+            log.warning("yt-dlp kill failed: %s", exc)
+        job.ytdlp_process = None
+        # Clean up partially downloaded files
+        out_dir = job.ytdlp_out_dir
+        if out_dir and out_dir.is_dir():
+            for f in out_dir.glob("*.mp3"):
+                try:
+                    f.unlink()
+                    log.info("Partial mp3 removed: %s", f.name)
+                except Exception:
+                    pass
+            for f in out_dir.glob("*.part"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        job.ytdlp_out_dir = None
+        job.status = "failed"
+
+    # ── Cancel whisper job if active ──────────────────────────────────────────
+    if job.whisper_job_id:
+        try:
+            resp = requests.delete(
+                f"{WHISPER_SERVICE_URL}/transcribe/{job.whisper_job_id}",
+                timeout=5,
+            )
+            if resp.status_code in (200, 404):
+                log.info("Whisper job %s cancelled", job.whisper_job_id[:8])
+            else:
+                log.warning("Whisper cancel returned %d", resp.status_code)
+        except Exception as exc:
+            log.warning("Whisper cancel request failed: %s", exc)
+        job.whisper_job_id = None
 
 
 # ─── Cache management ─────────────────────────────────────────────────────────
@@ -584,6 +615,8 @@ class Job:
         self.transcript: Optional[str] = None
         self.chat_history: list = []      # [{role, content}, ...]
         self.whisper_job_id: Optional[str] = None  # set during whisper phase only
+        self.ytdlp_process: Optional[subprocess.Popen] = None  # yt-dlp download subprocess
+        self.ytdlp_out_dir: Optional[Path] = None  # for cleanup on cancel
         self._lock         = threading.Lock()
 
     def log(self, line: str):
@@ -878,11 +911,20 @@ def run_workflow(job: Job):
             mp3s = list(out_dir.glob("*.mp3"))
             if not mp3s:
                 job.log("Downloading audio...")
-                subprocess.run([
+                job.ytdlp_out_dir = out_dir
+                job.ytdlp_process = subprocess.Popen([
                     YT_DLP_BIN, "--extract-audio", "--audio-format", "mp3",
                     "--audio-quality", "0",
                     "--output", str(out_dir / "%(title)s.%(ext)s"), job.url,
-                ], capture_output=True)
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                job.ytdlp_process.communicate()
+                rc = job.ytdlp_process.returncode
+                job.ytdlp_process = None
+                job.ytdlp_out_dir = None
+                # Check if cancelled during download
+                if job.status == "failed":
+                    job.log("Download cancelled.")
+                    return
                 mp3s = list(out_dir.glob("*.mp3"))
             if not mp3s:
                 raise RuntimeError("Audio download failed.")
@@ -903,28 +945,10 @@ def run_workflow(job: Job):
             job.log(f"Whisper job submitted: {whisper_job_id[:8]}...")
 
             # ── Poll for completion ───────────────────────────────────────────
-            # Import Streamlit runtime for session liveness check
-            try:
-                from streamlit.runtime import get_instance
-                from streamlit.runtime.scriptrunner import get_script_run_ctx
-                _st_runtime = get_instance()
-                _st_ctx     = get_script_run_ctx()
-            except Exception:
-                _st_runtime = None
-                _st_ctx     = None
-
+            # Watchdog runs in whisper-service — no liveness check needed here.
+            # If app.py stops polling, the per-job watchdog fires automatically.
             while True:
                 time.sleep(WHISPER_POLL_INTERVAL)
-
-                # Stop polling if Streamlit session has ended (tab closed / Stop)
-                if _st_runtime and _st_ctx:
-                    try:
-                        if not _st_runtime.is_active_session(_st_ctx.session_id):
-                            job.log("Session ended — stopping whisper poll.")
-                            log.info("Session ended for job %s — stopping poll", job.job_id[:8])
-                            break
-                    except Exception:
-                        pass  # if check fails, continue polling
 
                 poll = requests.get(
                     f"{WHISPER_SERVICE_URL}/transcribe/{whisper_job_id}",
@@ -1042,6 +1066,10 @@ def run_workflow(job: Job):
 def render_css():
     st.markdown("""<style>
     .block-container{max-width:1400px;padding-top:2rem}
+    /* Hide Streamlit Stop button — background threads outlive the UI process */
+    button[kind="header"] {display:none !important}
+    #MainMenu {visibility:hidden}
+    footer {visibility:hidden}
     .input-div{background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;
                padding:1.5rem 2rem;margin-bottom:1.5rem}
     .output-div{background:#fff;border:1px solid #dee2e6;border-radius:8px;
@@ -1246,6 +1274,14 @@ def main():
                 st.markdown(
                     f'<div class="log-box">{"<br>".join(lines)}</div>',
                     unsafe_allow_html=True)
+            # Cancel button — right-justified below console
+            _, col_cancel = st.columns([4, 1])
+            with col_cancel:
+                if st.button("⏹ Cancel", key="cancel_btn", use_container_width=True):
+                    cancel_whisper_job(st.session_state.get("job"))
+                    st.session_state.input_counter += 1
+                    st.session_state.job = None
+                    st.rerun()
             time.sleep(POLL_INTERVAL_MS / 1000)
             st.rerun()
 

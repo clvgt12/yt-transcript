@@ -39,10 +39,10 @@ log = logging.getLogger("yt-transcribe-web")
 # ─── Configuration from environment ──────────────────────────────────────────
 
 FILES_BASE            = Path(os.environ.get("FILES_BASE",           "/usr/app/files"))
-YT_DLP_BIN            = os.environ.get("YT_DLP_BIN",               "/usr/local/bin/yt-dlp")
 WHISPER_MODEL         = os.environ.get("WHISPER_MODEL",            "small")
 WHISPER_SERVICE_URL   = os.environ.get("WHISPER_SERVICE_URL",      "http://whisper:8000")
 WHISPER_POLL_INTERVAL = int(os.environ.get("WHISPER_POLL_INTERVAL", "3"))
+YTDLP_SERVICE_URL     = os.environ.get("YTDLP_SERVICE_URL",        "http://ytdlp:8001")
 SUMMARIZE           = os.environ.get("SUMMARIZE",              "true").lower() == "true"
 OLLAMA_URL            = os.environ.get("OLLAMA_URL",             "http://ollama:11434")
 OLLAMA_PRIMARY_MODEL  = os.environ.get("OLLAMA_PRIMARY_MODEL",   "gpt-oss:120b-cloud")
@@ -300,43 +300,31 @@ def clean_response(text: str) -> str:
     return text
 
 
-def cancel_whisper_job(job: "Job"):
+def cancel_active_jobs(job: "Job"):
     """
-    Cancel any active processing on the job:
-    - Kills yt-dlp download subprocess and cleans up partial mp3 if downloading
-    - Sends DELETE to whisper service if whisper transcription is active
+    Cancel any active service jobs on this job object:
+    - Sends DELETE to ytdlp-service if a download is in progress
+    - Sends DELETE to whisper-service if transcription is in progress
     """
     if not job:
         return
 
-    # ── Kill yt-dlp download if active ───────────────────────────────────────
-    proc = job.ytdlp_process
-    if proc is not None:
+    # ── Cancel ytdlp-service job if active ───────────────────────────────────
+    if job.ytdlp_job_id:
         try:
-            if proc.returncode is None:
-                proc.kill()
-                log.info("yt-dlp download killed for job %s", job.job_id[:8])
+            resp = requests.delete(
+                f"{YTDLP_SERVICE_URL}/download/{job.ytdlp_job_id}",
+                timeout=5,
+            )
+            if resp.status_code in (200, 404):
+                log.info("ytdlp job %s cancelled", job.ytdlp_job_id[:8])
+            else:
+                log.warning("ytdlp cancel returned %d", resp.status_code)
         except Exception as exc:
-            log.warning("yt-dlp kill failed: %s", exc)
-        job.ytdlp_process = None
-        # Clean up partially downloaded files
-        out_dir = job.ytdlp_out_dir
-        if out_dir and out_dir.is_dir():
-            for f in out_dir.glob("*.mp3"):
-                try:
-                    f.unlink()
-                    log.info("Partial mp3 removed: %s", f.name)
-                except Exception:
-                    pass
-            for f in out_dir.glob("*.part"):
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-        job.ytdlp_out_dir = None
-        job.status = "failed"
+            log.warning("ytdlp cancel failed: %s", exc)
+        job.ytdlp_job_id = None
 
-    # ── Cancel whisper job if active ──────────────────────────────────────────
+    # ── Cancel whisper-service job if active ──────────────────────────────────
     if job.whisper_job_id:
         try:
             resp = requests.delete(
@@ -348,8 +336,44 @@ def cancel_whisper_job(job: "Job"):
             else:
                 log.warning("Whisper cancel returned %d", resp.status_code)
         except Exception as exc:
-            log.warning("Whisper cancel request failed: %s", exc)
+            log.warning("Whisper cancel failed: %s", exc)
         job.whisper_job_id = None
+
+
+def poll_service(url: str, interval: int, job: "Job",
+                  cancel_attr: str, log_running: str) -> Optional[dict]:
+    """
+    Generic polling loop for ytdlp-service and whisper-service.
+    Polls GET {url} every {interval} seconds.
+    Returns response dict when status==done, None if cancelled/failed cleanly.
+    Raises RuntimeError on service failure.
+    cancel_attr: name of job attribute holding the service job_id (for cancel detection)
+    """
+    while True:
+        time.sleep(interval)
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 404:
+            log.info("Service job cancelled (404) — %s", url)
+            setattr(job, cancel_attr, None)
+            return None
+        resp.raise_for_status()
+        data   = resp.json()
+        status = data.get("status", "")
+        if status == "running":
+            job.log(log_running)
+        elif status == "queued":
+            job.log("Queued, waiting...")
+        elif status == "done":
+            setattr(job, cancel_attr, None)
+            return data
+        elif status == "failed":
+            error = data.get("error", "")
+            if any(x in error.lower() for x in
+                   ("cancelled by client", "watchdog", "terminated")):
+                log.info("Service job stopped cleanly: %s", error)
+                setattr(job, cancel_attr, None)
+                return None
+            raise RuntimeError(f"Service failed: {error}")
 
 
 # ─── Cache management ─────────────────────────────────────────────────────────
@@ -615,8 +639,7 @@ class Job:
         self.transcript: Optional[str] = None
         self.chat_history: list = []      # [{role, content}, ...]
         self.whisper_job_id: Optional[str] = None  # set during whisper phase only
-        self.ytdlp_process: Optional[subprocess.Popen] = None  # yt-dlp download subprocess
-        self.ytdlp_out_dir: Optional[Path] = None  # for cleanup on cancel
+        self.ytdlp_job_id:   Optional[str] = None  # set during ytdlp-service phase only
         self._lock         = threading.Lock()
 
     def log(self, line: str):
@@ -839,15 +862,29 @@ def run_workflow(job: Job):
         job.log("Resolving video metadata...")
         video_id = extract_video_id(job.url)
         if not video_id:
-            r = subprocess.run([YT_DLP_BIN, "--print", "id", job.url],
-                               capture_output=True, text=True)
-            video_id = r.stdout.strip()
-        if not video_id:
-            raise RuntimeError("Could not extract video ID.")
+            raise RuntimeError("Could not extract video ID from URL.")
 
-        r2 = subprocess.run([YT_DLP_BIN, "--print", "title", job.url],
-                            capture_output=True, text=True)
-        video_title = r2.stdout.strip() or "unknown_title"
+        # ── Fetch metadata via ytdlp-service ──────────────────────────────────
+        resp = requests.post(
+            f"{YTDLP_SERVICE_URL}/download",
+            json={"video_id": video_id, "meta": True},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        meta_job_id = resp.json()["job_id"]
+        job.ytdlp_job_id = meta_job_id
+
+        data = poll_service(
+            url         = f"{YTDLP_SERVICE_URL}/download/{meta_job_id}",
+            interval    = WHISPER_POLL_INTERVAL,
+            job         = job,
+            cancel_attr = "ytdlp_job_id",
+            log_running = "Fetching video metadata...",
+        )
+        if data is None:
+            return   # cancelled
+
+        video_title = data.get("title") or "unknown_title"
         safe_title  = sanitize_title(video_title)
 
         job.log(f"Video ID : {video_id}")
@@ -879,110 +916,111 @@ def run_workflow(job: Job):
             job.finished_at = datetime.now(UTC).isoformat()
             return
 
-        # ── Transcription ─────────────────────────────────────────────────────
+        # ── Transcription via ytdlp-service ──────────────────────────────────
         transcript_source = "cached"
 
         if txt_path.exists() and not FORCE_WHISPER:
             job.log(f"Transcript cached: {txt_path.name}")
             transcript = txt_path.read_text(encoding="utf-8")
-        elif not FORCE_WHISPER:
-            transcript = None
-            for sub_flag, label in [("--write-subs", "human"),
-                                     ("--write-auto-subs", "auto-generated")]:
-                job.log(f"Checking for {label} subtitles...")
-                subprocess.run([
-                    YT_DLP_BIN, "--skip-download", sub_flag,
-                    "--sub-lang", "en", "--sub-format", "vtt",
-                    "--output", str(out_dir / "%(title)s.%(ext)s"), job.url,
-                ], capture_output=True)
-                vtts = [f for f in out_dir.glob("*.en.vtt") if "live_chat" not in f.name]
-                if vtts:
-                    job.log(f"Found {label} subtitles.")
-                    transcript = vtt_to_text(vtts[0])
-                    vtts[0].unlink(missing_ok=True)
-                    txt_path.write_text(transcript, encoding="utf-8")
-                    transcript_source = f"youtube-{label.replace(' ', '-')}"
-                    break
         else:
             transcript = None
 
-        if transcript is None:
-            job.log("Using Whisper transcription service...")
-            mp3s = list(out_dir.glob("*.mp3"))
-            if not mp3s:
-                job.log("Downloading audio...")
-                job.ytdlp_out_dir = out_dir
-                job.ytdlp_process = subprocess.Popen([
-                    YT_DLP_BIN, "--extract-audio", "--audio-format", "mp3",
-                    "--audio-quality", "0",
-                    "--output", str(out_dir / "%(title)s.%(ext)s"), job.url,
-                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                job.ytdlp_process.communicate()
-                rc = job.ytdlp_process.returncode
-                job.ytdlp_process = None
-                job.ytdlp_out_dir = None
-                # Check if cancelled during download
-                if job.status == "failed":
-                    job.log("Download cancelled.")
-                    return
-                mp3s = list(out_dir.glob("*.mp3"))
-            if not mp3s:
-                raise RuntimeError("Audio download failed.")
-            audio_path = mp3s[0]
-
-            # ── Submit to whisper-service ─────────────────────────────────────
-            job.log(f"Submitting audio to whisper-service (model: {WHISPER_MODEL})...")
-            with open(audio_path, "rb") as af:
+            if not FORCE_WHISPER:
+                # ── Try subtitles first (human then auto) ────────────────────
+                job.log("Requesting subtitles from ytdlp-service...")
                 resp = requests.post(
-                    f"{WHISPER_SERVICE_URL}/transcribe",
-                    files={"file": (audio_path.name, af, "audio/mpeg")},
-                    params={"model": WHISPER_MODEL},
-                    timeout=30,
-                )
-            resp.raise_for_status()
-            whisper_job_id      = resp.json()["job_id"]
-            job.whisper_job_id  = whisper_job_id   # track for cancellation
-            job.log(f"Whisper job submitted: {whisper_job_id[:8]}...")
-
-            # ── Poll for completion ───────────────────────────────────────────
-            # Watchdog runs in whisper-service — no liveness check needed here.
-            # If app.py stops polling, the per-job watchdog fires automatically.
-            while True:
-                time.sleep(WHISPER_POLL_INTERVAL)
-
-                poll = requests.get(
-                    f"{WHISPER_SERVICE_URL}/transcribe/{whisper_job_id}",
+                    f"{YTDLP_SERVICE_URL}/download",
+                    json={"video_id": video_id, "human": True, "auto": True},
                     timeout=10,
                 )
-                # 404 means job was cancelled by client — exit poll loop cleanly
-                if poll.status_code == 404:
-                    log.info("Whisper job %s cancelled — stopping poll", whisper_job_id[:8])
-                    job.whisper_job_id = None
-                    return   # exit run_workflow entirely, job already cancelled
-                poll.raise_for_status()
-                data = poll.json()
-                status = data["status"]
+                resp.raise_for_status()
+                ytdlp_job_id     = resp.json()["job_id"]
+                job.ytdlp_job_id = ytdlp_job_id
+                job.log(f"ytdlp job submitted: {ytdlp_job_id[:8]}...")
 
-                if status == "running":
-                    job.log("Whisper transcription in progress...")
-                elif status == "done":
-                    transcript = data["transcript"]
-                    txt_path.write_text(transcript, encoding="utf-8")
-                    job.whisper_job_id = None   # whisper phase complete
-                    job.log(f"Whisper transcription complete.")
-                    break
-                elif status == "failed":
-                    # Check if cancelled by client (watchdog or DELETE)
-                    error = data.get("error", "")
-                    if "Cancelled by client" in error or "watchdog" in error.lower():
-                        log.info("Whisper job %s stopped: %s", whisper_job_id[:8], error)
-                        job.whisper_job_id = None
-                        return   # exit cleanly, no error state
-                    raise RuntimeError(f"Whisper service failed: {error}")
-                elif status == "queued":
-                    job.log("Whisper job queued, waiting...")
+                data = poll_service(
+                    url         = f"{YTDLP_SERVICE_URL}/download/{ytdlp_job_id}",
+                    interval    = WHISPER_POLL_INTERVAL,
+                    job         = job,
+                    cancel_attr = "ytdlp_job_id",
+                    log_running = "Fetching subtitles...",
+                )
+                if data is None:
+                    return   # cancelled
 
-            transcript_source = f"whisper-{WHISPER_MODEL}"
+                subtitle_source = data.get("subtitle_source", "none")
+                if subtitle_source in ("human", "auto"):
+                    transcript        = data.get("transcript")
+                    transcript_source = f"youtube-{subtitle_source}"
+                    if transcript:
+                        txt_path.write_text(transcript, encoding="utf-8")
+                        job.log(f"Subtitles downloaded ({subtitle_source}).")
+
+            if transcript is None:
+                # ── No subtitles — download mp3 via ytdlp-service ────────────
+                mp3s = list(out_dir.glob("*.mp3"))
+                if not mp3s:
+                    job.log("Requesting audio download from ytdlp-service...")
+                    resp = requests.post(
+                        f"{YTDLP_SERVICE_URL}/download",
+                        json={"video_id": video_id, "audio": True},
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    ytdlp_job_id     = resp.json()["job_id"]
+                    job.ytdlp_job_id = ytdlp_job_id
+                    job.log(f"ytdlp audio job: {ytdlp_job_id[:8]}...")
+
+                    data = poll_service(
+                        url         = f"{YTDLP_SERVICE_URL}/download/{ytdlp_job_id}",
+                        interval    = WHISPER_POLL_INTERVAL,
+                        job         = job,
+                        cancel_attr = "ytdlp_job_id",
+                        log_running = "Downloading audio...",
+                    )
+                    if data is None:
+                        return   # cancelled
+
+                    audio_path_str = data.get("audio_path")
+                    if not audio_path_str:
+                        raise RuntimeError("Audio download failed — no path returned.")
+                    mp3s = [Path(audio_path_str)]
+                    job.log(f"Audio downloaded: {mp3s[0].name}")
+                else:
+                    job.log(f"Using cached audio: {mp3s[0].name}")
+
+                audio_path = mp3s[0]
+
+                # ── Submit to whisper-service ─────────────────────────────────
+                job.log(f"Submitting to whisper-service (model: {WHISPER_MODEL})...")
+                with open(audio_path, "rb") as af:
+                    resp = requests.post(
+                        f"{WHISPER_SERVICE_URL}/transcribe",
+                        files={"file": (audio_path.name, af, "audio/mpeg")},
+                        params={"model": WHISPER_MODEL},
+                        timeout=30,
+                    )
+                resp.raise_for_status()
+                whisper_job_id     = resp.json()["job_id"]
+                job.whisper_job_id = whisper_job_id
+                job.log(f"Whisper job submitted: {whisper_job_id[:8]}...")
+
+                data = poll_service(
+                    url         = f"{WHISPER_SERVICE_URL}/transcribe/{whisper_job_id}",
+                    interval    = WHISPER_POLL_INTERVAL,
+                    job         = job,
+                    cancel_attr = "whisper_job_id",
+                    log_running = "Whisper transcription in progress...",
+                )
+                if data is None:
+                    return   # cancelled
+
+                transcript = data.get("transcript")
+                if not transcript:
+                    raise RuntimeError("Whisper returned no transcript.")
+                txt_path.write_text(transcript, encoding="utf-8")
+                job.log("Whisper transcription complete.")
+                transcript_source = f"whisper-{WHISPER_MODEL}"
 
         job.log(f"Transcript source: {transcript_source}")
         job.transcript = transcript
@@ -1115,7 +1153,7 @@ def main():
             cleared = st.form_submit_button("✕  Clear", use_container_width=True)
 
     if cleared:
-        cancel_whisper_job(st.session_state.get("job"))
+        cancel_active_jobs(st.session_state.get("job"))
         st.session_state.input_counter += 1  # new key → new widget instance → empty value
         st.session_state.job = None
         st.rerun()
@@ -1248,7 +1286,7 @@ def main():
                     st.rerun()
 
             if st.button("🔄 Transcribe another video"):
-                cancel_whisper_job(st.session_state.get("job"))
+                cancel_active_jobs(st.session_state.get("job"))
                 st.session_state.input_counter += 1
                 st.session_state.job = None
                 st.rerun()
@@ -1277,8 +1315,18 @@ def main():
             # Cancel button — right-justified below console
             _, col_cancel = st.columns([4, 1])
             with col_cancel:
-                if st.button("⏹ Cancel", key="cancel_btn", use_container_width=True):
-                    cancel_whisper_job(st.session_state.get("job"))
+                # Enable Cancel only when a service job is active
+                _job      = st.session_state.get("job")
+                _can_cancel = bool(
+                    _job and (
+                        getattr(_job, "ytdlp_job_id",   None) or
+                        getattr(_job, "whisper_job_id", None)
+                    )
+                )
+                if st.button("⏹ Cancel", key="cancel_btn",
+                             use_container_width=True,
+                             disabled=not _can_cancel):
+                    cancel_active_jobs(_job)
                     st.session_state.input_counter += 1
                     st.session_state.job = None
                     st.rerun()

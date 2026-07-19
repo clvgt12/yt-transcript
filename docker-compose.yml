@@ -83,6 +83,30 @@ services:
       retries: 4
       start_period: 30s
 
+  # ── yt-dlp download microservice ────────────────────────────────────────────
+  ytdlp:
+    build:
+      context: .
+      dockerfile: Dockerfile.ytdlp
+    image: yt-transcribe-ytdlp:latest
+    container_name: yt-transcribe-ytdlp
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    volumes:
+      - ${HOME}/yt-transcribe/web/files:/files
+    environment:
+      YT_DLP_BIN:          /usr/local/bin/yt-dlp
+      FILES_BASE:          /files
+      JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
+      POLL_INTERVAL_MS:    ${POLL_INTERVAL_MS:-2000}
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
   # ── Streamlit web application ───────────────────────────────────────────────
   web:
     build:
@@ -96,6 +120,8 @@ services:
         condition: service_healthy
       whisper:
         condition: service_healthy
+      ytdlp:
+        condition: service_healthy
     networks:
       - yt-transcribe-net
     ports:
@@ -108,6 +134,7 @@ services:
       FORCE_WHISPER:          ${FORCE_WHISPER:-false}
       WHISPER_SERVICE_URL:    http://whisper:8000
       WHISPER_POLL_INTERVAL:  ${WHISPER_POLL_INTERVAL:-3}
+      YTDLP_SERVICE_URL:      http://ytdlp:8001
       # Summarization
       SUMMARIZE:            ${SUMMARIZE:-true}
       OLLAMA_URL:             http://ollama:11434

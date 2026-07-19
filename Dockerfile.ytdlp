@@ -1,0 +1,63 @@
+# ytdlp-service Dockerfile
+# Base: Ubuntu 24.04 LTS — matches kamakazi host OS, no GPU needed
+FROM ubuntu:24.04
+
+LABEL maintainer="chris@kamakazi"
+LABEL description="yt-dlp download microservice (FastAPI + async + per-job watchdog)"
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ─── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    ffmpeg \
+    wget \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Install yt-dlp binary ────────────────────────────────────────────────────
+RUN wget -q "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
+    -O /usr/local/bin/yt-dlp \
+    && chmod 755 /usr/local/bin/yt-dlp
+
+# ─── Python virtual environment ───────────────────────────────────────────────
+RUN python3 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# ─── Python dependencies ──────────────────────────────────────────────────────
+COPY ytdlp_requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+WORKDIR /app
+COPY ytdlp_service.py /app/ytdlp_service.py
+
+# ─── Output directory (shared host mount) ─────────────────────────────────────
+RUN mkdir -p /files && chown ubuntu:ubuntu /files
+
+VOLUME ["/files"]
+
+# ─── Set ownership of app and venv ────────────────────────────────────────────
+RUN chown -R ubuntu:ubuntu /app /venv /home/ubuntu
+
+# ─── Switch to non-root user ──────────────────────────────────────────────────
+USER ubuntu
+
+# ─── Environment defaults ─────────────────────────────────────────────────────
+ENV YT_DLP_BIN=/usr/local/bin/yt-dlp
+ENV FILES_BASE=/files
+ENV JOB_TIMEOUT_SECONDS=300
+ENV POLL_INTERVAL_MS=2000
+
+# ─── Port ─────────────────────────────────────────────────────────────────────
+EXPOSE 8001
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+CMD ["/venv/bin/uvicorn", "ytdlp_service:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8001", \
+     "--workers", "1"]

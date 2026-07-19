@@ -1,0 +1,5 @@
+# ytdlp-service Python dependencies
+# No PyTorch needed — yt-dlp service is CPU-only
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0

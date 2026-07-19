@@ -339,6 +339,17 @@ def cancel_active_jobs(job: "Job"):
             log.warning("Whisper cancel failed: %s", exc)
         job.whisper_job_id = None
 
+    # ── Abort Ollama inference if active ─────────────────────────────────────
+    sess = job.ollama_session
+    if sess is not None:
+        job.ollama_session = None   # signal polling loop FIRST
+        try:
+            sess.close()            # then close TCP — unblocks _generate thread
+            job.log("Cancel received — Ollama inference aborted.")
+            log.info("Ollama session closed for job %s", job.job_id[:8])
+        except Exception as exc:
+            log.warning("Ollama session close failed: %s", exc)
+
 
 def poll_service(url: str, interval: int, job: "Job",
                   cancel_attr: str, log_running: str) -> Optional[dict]:
@@ -536,7 +547,10 @@ Use them to enrich your answer and cite source URLs where relevant.
                     headers = {"Content-Type": "application/json"}
                     if OLLAMA_API_KEY:
                         headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
-                    resp = requests.post(
+                    session = requests.Session()
+                    # Note: chat jobs don't have a Job ref here — session not
+                    # tracked for cancel. Cloud chat is fast; cancel via tab close.
+                    resp = session.post(
                         f"{OLLAMA_URL}/api/chat",
                         headers=headers,
                         json={
@@ -586,7 +600,17 @@ Use them to enrich your answer and cite source URLs where relevant.
 
             else:
                 # ── Local model: DDG results injected via system prompt ────────
-                resp = requests.post(
+                # Store session on job for cancellation support
+                _job_ref = None
+                import streamlit as _st
+                try:
+                    _job_ref = _st.session_state.get("job")
+                except Exception:
+                    pass
+                session = requests.Session()
+                if _job_ref is not None:
+                    _job_ref.ollama_session = session
+                resp = session.post(
                     f"{OLLAMA_URL}/api/chat",
                     json={
                         "model":    model,
@@ -597,6 +621,8 @@ Use them to enrich your answer and cite source URLs where relevant.
                     },
                     timeout=300,
                 )
+                if _job_ref is not None:
+                    _job_ref.ollama_session = None
                 resp.raise_for_status()
                 data  = resp.json()
                 msg   = data.get("message", {})
@@ -610,6 +636,9 @@ Use them to enrich your answer and cite source URLs where relevant.
                     log.info("Chat complete with model '%s' (DDG context)", model)
                     return reply
 
+        except requests.exceptions.ConnectionError:
+            log.info("Ollama chat aborted (session closed) for model '%s'", model)
+            return None   # clean exit — caller handles None as cancel
         except Exception as exc:
             log.warning("Chat failed with model '%s': %s", model, exc)
 
@@ -638,9 +667,10 @@ class Job:
         self.video_title: Optional[str] = None
         self.transcript: Optional[str] = None
         self.chat_history: list = []      # [{role, content}, ...]
-        self.whisper_job_id: Optional[str] = None  # set during whisper phase only
-        self.ytdlp_job_id:   Optional[str] = None  # set during ytdlp-service phase only
-        self._lock         = threading.Lock()
+        self.whisper_job_id:  Optional[str]              = None  # set during whisper phase only
+        self.ytdlp_job_id:    Optional[str]              = None  # set during ytdlp phase only
+        self.ollama_session:  Optional[requests.Session] = None  # closed on cancel to abort inference
+        self._lock            = threading.Lock()
 
     def log(self, line: str):
         with self._lock:
@@ -1056,24 +1086,77 @@ def run_workflow(job: Job):
                 cloud = is_cloud_model(model)
                 label = f"cloud model '{model}'" if cloud else f"local model '{model}'"
                 job.log(f"Summarizing with {label}...")
-                try:
-                    resp = requests.post(
-                        f"{OLLAMA_URL}/api/generate",
-                        json={"model": model, "prompt": prompt,
-                              "stream": False, "think": False, "thinking": False},
-                        timeout=300,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if "response" in data:
-                        summary_md    = strip_think(data["response"])
-                        summary_model = f"{'ollama-cloud' if cloud else 'ollama-local'}:{model}"
-                        job.log(f"Summarization succeeded with {label}.")
-                        break
-                except Exception as exc:
-                    job.log(f"Summarization failed with {label}: {exc}")
+
+                # ── Run Ollama in a dedicated thread so UI can cancel ─────────
+                _result  = {}   # shared dict: keys 'response', 'error'
+                session  = requests.Session()
+                job.ollama_session = session
+
+                def _generate(_session, _model, _prompt, _result):
+                    try:
+                        # stream=True so Ollama detects TCP close immediately
+                        # and stops GPU inference — stream=False buffers the
+                        # entire response before writing to socket, making
+                        # connection-close cancellation ineffective.
+                        resp = _session.post(
+                            f"{OLLAMA_URL}/api/generate",
+                            json={"model": _model, "prompt": _prompt,
+                                  "stream": True, "think": False,
+                                  "thinking": False},
+                            timeout=300,
+                            stream=True,
+                        )
+                        resp.raise_for_status()
+                        # Accumulate streamed response chunks
+                        full_response = ""
+                        for line in resp.iter_lines():
+                            if line:
+                                chunk = json.loads(line)
+                                full_response += chunk.get("response", "")
+                                if chunk.get("done"):
+                                    break
+                        _result["response"] = {"response": full_response}
+                    except requests.exceptions.ConnectionError:
+                        _result["cancelled"] = True
+                    except Exception as exc:
+                        _result["error"] = str(exc)
+
+                t = threading.Thread(
+                    target=_generate,
+                    args=(session, model, prompt, _result),
+                    daemon=True,
+                    name=f"ollama-gen-{job.job_id[:8]}",
+                )
+                t.start()
+
+                # ── Wait for thread, poll for cancel every second ─────────────
+                while t.is_alive():
+                    t.join(timeout=1.0)
+                    if job.ollama_session is None:
+                        # Session was closed by cancel_active_jobs()
+                        log.info("Summarization cancelled for job %s", job.job_id[:8])
+                        t.join(timeout=5.0)   # wait for thread to exit
+                        return   # clean exit
+
+                job.ollama_session = None
+
+                if _result.get("cancelled"):
+                    log.info("Summarization aborted (session closed) for job %s",
+                             job.job_id[:8])
+                    return   # clean exit
+
+                if "error" in _result:
+                    job.log(f"Summarization failed with {label}: {_result['error']}")
                     if model == models_to_try[-1]:
                         job.log("All summarization attempts failed.")
+                    continue
+
+                data = _result.get("response", {})
+                if "response" in data:
+                    summary_md    = strip_think(data["response"])
+                    summary_model = f"{'ollama-cloud' if cloud else 'ollama-local'}:{model}"
+                    job.log(f"Summarization succeeded with {label}.")
+                    break
 
         # ── Write output files ────────────────────────────────────────────────
         if summary_md:
@@ -1133,6 +1216,8 @@ def main():
     # ── Initialise session state ───────────────────────────────────────────────
     if "job" not in st.session_state:
         st.session_state.job = None
+    if "cancel_requested" not in st.session_state:
+        st.session_state.cancel_requested = False
 
     # ── INPUT DIV ─────────────────────────────────────────────────────────────
     st.markdown("#### Input")
@@ -1315,21 +1400,22 @@ def main():
             # Cancel button — right-justified below console
             _, col_cancel = st.columns([4, 1])
             with col_cancel:
-                # Enable Cancel only when a service job is active
-                _job      = st.session_state.get("job")
-                _can_cancel = bool(
-                    _job and (
-                        getattr(_job, "ytdlp_job_id",   None) or
-                        getattr(_job, "whisper_job_id", None)
-                    )
-                )
+                # Use on_click callback + session_state flag for reliable
+                # cancel detection in polling loop
+                def _request_cancel():
+                    st.session_state.cancel_requested = True
+
                 if st.button("⏹ Cancel", key="cancel_btn",
                              use_container_width=True,
-                             disabled=not _can_cancel):
-                    cancel_active_jobs(_job)
-                    st.session_state.input_counter += 1
-                    st.session_state.job = None
-                    st.rerun()
+                             on_click=_request_cancel):
+                    pass  # action handled via cancel_requested flag below
+            # Check for cancel request set by button on_click callback
+            if st.session_state.get("cancel_requested"):
+                st.session_state.cancel_requested = False
+                cancel_active_jobs(st.session_state.get("job"))
+                st.session_state.input_counter += 1
+                st.session_state.job = None
+                st.rerun()
             time.sleep(POLL_INTERVAL_MS / 1000)
             st.rerun()
 

@@ -766,20 +766,23 @@ Answer the following:
 
 """
 
-    # Build metadata context line for the prompt header
-    meta_parts = []
+    # Speaker inference hint — metadata framed at top of prompt for maximum attention
+    speaker_hint = ""
     if title:
-        meta_parts.append(f"Title: {title}")
+        speaker_hint += "The video title is: " + repr(title) + ". "
+        speaker_hint += ("The title MAY contain the name of the presenter(s) of the video, "
+                         "whose dialog is captured in the transcript. ")
     if channel:
-        meta_parts.append(f"Channel: {channel}")
-    meta_context = " | ".join(meta_parts)
+        speaker_hint += "The video was published by: " + repr(channel) + ". "
 
     return textwrap.dedent(f"""
-        You are a professional analyst. Read the following transcript carefully and produce
-        a structured summary in Markdown format with exactly {"four" if title else "three"} sections:
+        You are a professional analyst. {speaker_hint}
+        Read the following transcript carefully and produce a structured summary
+        in Markdown format with exactly {"four" if title else "three"} sections:
 
         ## Summary
         Write a concise summary of 3-5 sentences covering the core subject and conclusions.
+        Identify the speaker by name and role where evident from the title or content.
 
         ## Key Points
         Bullet list of the most important facts, arguments, or events from the transcript.
@@ -790,7 +793,6 @@ Answer the following:
         Use clean Markdown formatting. Be precise and objective. Do not editorialize.
 
         ---
-        VIDEO METADATA: {meta_context}
         TRANSCRIPT:
         {transcript}
     """).strip()

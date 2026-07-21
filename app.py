@@ -464,7 +464,8 @@ def load_chat_history(video_id: str) -> list:
 
 
 def chat_with_ollama(history: list, transcript: str, title: str,
-                     search_results: list = None) -> Optional[str]:
+                     search_results: list = None,
+                     channel: str = None) -> Optional[str]:
     """
     Send conversation history to Ollama using the tools API with web_search
     and web_fetch for all models. Executes a tool-call loop until the model
@@ -491,7 +492,8 @@ Use them to enrich your answer and cite source URLs where relevant.
     if has_native_web_search(active_model):
         system_msg = textwrap.dedent(f"""
             You are a helpful analyst assistant with access to web search tools.
-            The user is asking follow-up questions about a YouTube video titled: "{title}"
+            The user is asking follow-up questions about a YouTube video.
+            Title: "{title}"{f" | Channel: {channel}" if channel else ""}
 
             IMPORTANT INSTRUCTIONS:
             - Use the web_search and web_fetch tools to find current information when needed.
@@ -511,7 +513,8 @@ Use them to enrich your answer and cite source URLs where relevant.
     else:
         system_msg = textwrap.dedent(f"""
             You are a helpful analyst assistant with access to web search results.
-            The user is asking follow-up questions about a YouTube video titled: "{title}"
+            The user is asking follow-up questions about a YouTube video.
+            Title: "{title}"{f" | Channel: {channel}" if channel else ""}
 
             IMPORTANT INSTRUCTIONS:
             - Respond directly with your answer. Do NOT narrate your reasoning process.
@@ -663,9 +666,10 @@ class Job:
         self.error: Optional[str] = None
         self.started_at    = datetime.now(UTC).isoformat()
         self.finished_at: Optional[str] = None
-        self.video_id: Optional[str] = None
-        self.video_title: Optional[str] = None
-        self.transcript: Optional[str] = None
+        self.video_id:      Optional[str] = None
+        self.video_title:   Optional[str] = None
+        self.video_channel: Optional[str] = None
+        self.transcript:    Optional[str] = None
         self.chat_history: list = []      # [{role, content}, ...]
         self.whisper_job_id:  Optional[str]              = None  # set during whisper phase only
         self.ytdlp_job_id:    Optional[str]              = None  # set during ytdlp phase only
@@ -748,7 +752,8 @@ def vtt_to_text(vtt_path: Path) -> str:
     return "\n\n".join(paragraphs)
 
 
-def build_prompt(transcript: str, title: str = "") -> str:
+def build_prompt(transcript: str, title: str = "",
+                  channel: str = None) -> str:
     title_section = ""
     if title:
         title_section = f"""
@@ -760,6 +765,14 @@ Answer the following:
 - **What the transcript actually covers**: One sentence describing the real subject matter if it differs from the title.
 
 """
+
+    # Build metadata context line for the prompt header
+    meta_parts = []
+    if title:
+        meta_parts.append(f"Title: {title}")
+    if channel:
+        meta_parts.append(f"Channel: {channel}")
+    meta_context = " | ".join(meta_parts)
 
     return textwrap.dedent(f"""
         You are a professional analyst. Read the following transcript carefully and produce
@@ -777,6 +790,7 @@ Answer the following:
         Use clean Markdown formatting. Be precise and objective. Do not editorialize.
 
         ---
+        VIDEO METADATA: {meta_context}
         TRANSCRIPT:
         {transcript}
     """).strip()
@@ -914,13 +928,17 @@ def run_workflow(job: Job):
         if data is None:
             return   # cancelled
 
-        video_title = data.get("title") or "unknown_title"
-        safe_title  = sanitize_title(video_title)
+        video_title   = data.get("title")   or "unknown_title"
+        video_channel = data.get("channel") or None
+        safe_title    = sanitize_title(video_title)
 
         job.log(f"Video ID : {video_id}")
         job.log(f"Title    : {video_title}")
-        job.video_id    = video_id
-        job.video_title = video_title
+        if video_channel:
+            job.log(f"Channel  : {video_channel}")
+        job.video_id      = video_id
+        job.video_title   = video_title
+        job.video_channel = video_channel
 
         out_dir = FILES_BASE / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1060,7 +1078,8 @@ def run_workflow(job: Job):
         summary_model = "none"
 
         if SUMMARIZE:
-            prompt = build_prompt(transcript, title=video_title)
+            prompt = build_prompt(transcript, title=video_title,
+                                    channel=job.video_channel)
 
             # Wait for local Ollama to be ready
             for attempt in range(30):
@@ -1359,6 +1378,7 @@ def main():
                             job.chat_history, job.transcript,
                             job.video_title or "this video",
                             search_results=search_results,
+                            channel=job.video_channel,
                         )
                         if reply:
                             job.chat_history.append({"role": "assistant", "content": reply})

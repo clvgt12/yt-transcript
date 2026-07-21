@@ -126,6 +126,7 @@ class Job:
         self.status     = "queued"   # queued | running | done | failed
         # Results
         self.title:            Optional[str] = None
+        self.channel:          Optional[str] = None   # YouTube channel/uploader name
         self.subtitle_source:  Optional[str] = None   # human | auto | none
         self.transcript:       Optional[str] = None
         self.audio_path:       Optional[str] = None
@@ -301,15 +302,19 @@ def download_worker(job: Job):
     try:
         # ── 1. Metadata ───────────────────────────────────────────────────────
         if job.meta:
+            # Fetch title and channel in one yt-dlp call
             rc, stdout, stderr = _run_cmd(job, [
-                YT_DLP_BIN, "--print", "%(title)s", "--",
+                YT_DLP_BIN, "--print", "%(title)s	%(channel|uploader|NA)s", "--",
                 f"https://www.youtube.com/watch?v={video_id}"
             ])
             if job.status == "failed":
                 return
             if rc == 0 and stdout:
-                job.title = stdout
-                log.info("[%s] Title: %s", job.job_id[:8], job.title)
+                parts        = stdout.split("	", 1)
+                job.title    = parts[0].strip()
+                job.channel  = parts[1].strip() if len(parts) > 1 else None
+                log.info("[%s] Title: %s | Channel: %s",
+                         job.job_id[:8], job.title, job.channel)
             else:
                 raise RuntimeError(f"Metadata fetch failed: {stderr[:200]}")
 
@@ -418,6 +423,7 @@ class JobStatusResponse(BaseModel):
     video_id:        str
     status:          str
     title:           Optional[str]
+    channel:         Optional[str]
     subtitle_source: Optional[str]
     transcript:      Optional[str]
     audio_path:      Optional[str]
@@ -510,6 +516,7 @@ def poll_download(job_id: str):
         video_id=job.video_id,
         status=job.status,
         title=job.title,
+        channel=job.channel,
         subtitle_source=job.subtitle_source,
         transcript=job.transcript,
         audio_path=job.audio_path,

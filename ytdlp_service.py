@@ -309,12 +309,26 @@ def download_worker(job: Job):
             ])
             if job.status == "failed":
                 return
+            # Treat JS runtime warning as non-fatal — yt-dlp still extracts
+            # metadata for most videos without a JS runtime
+            js_warning = "no supported javascript runtime" in stderr.lower()
+            if js_warning:
+                log.warning("[%s] yt-dlp JS runtime warning (non-fatal): %s",
+                            job.job_id[:8], stderr[:120])
             if rc == 0 and stdout:
                 parts        = stdout.split("	", 1)
                 job.title    = parts[0].strip()
                 job.channel  = parts[1].strip() if len(parts) > 1 else None
+                if job.channel in ("NA", ""):
+                    job.channel = None
                 log.info("[%s] Title: %s | Channel: %s",
                          job.job_id[:8], job.title, job.channel)
+            elif js_warning and not stdout:
+                # JS runtime is blocking extraction entirely for this video
+                raise RuntimeError(
+                    "YouTube requires a JavaScript runtime for this video. "
+                    "Deno is being installed — please retry after container rebuild."
+                )
             else:
                 raise RuntimeError(f"Metadata fetch failed: {stderr[:200]}")
 

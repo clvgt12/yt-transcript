@@ -1,0 +1,74 @@
+# whisper-service Dockerfile - Intel OpenVINO architecture
+FROM ubuntu:24.04
+
+LABEL maintainer="chris@kamakazi"
+LABEL description="OpenAI Whisper transcription microservice (FastAPI + async) - Intel OpenVINO architecture"
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ─── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    ocl-icd-libopencl1 \
+    intel-opencl-icd \
+    intel-level-zero-gpu \
+    level-zero \
+    && rm -rf /var/lib/apt/lists/*
+    
+# ─── Set up OpenVINO compute stack ────────────────────────────────────────────
+RUN usermod -a -G render ubuntu
+
+# ─── Python virtual environment ───────────────────────────────────────────────
+RUN python3 -m venv /venv
+ENV PATH="/venv/bin:$PATH"
+
+# ─── Install Intel OpenVINO Python libraries  ───────────────────────────────
+RUN pip install --no-cache-dir \
+    optimum[openvino] \
+    "datasets<4" \
+    librosa \
+    soundfile \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+# ─── Remaining Python dependencies from PyPI ─────────────────────────────────
+COPY ./whisper/requirements-openvino.txt /tmp/requirements-openvino.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-openvino.txt
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+WORKDIR /app
+COPY whisper/whisper_service.py /app/whisper_service.py
+
+# ─── Whisper model cache directory ───────────────────────────────────────────
+RUN mkdir -p /whisper-cache
+VOLUME ["/whisper-cache"]
+
+# ─── Set ownership of app and venv ────────────────────────────────────────────
+RUN chown -R ubuntu:ubuntu /app /venv /whisper-cache /home/ubuntu
+
+# ─── Switch to non-root user ──────────────────────────────────────────────────
+USER ubuntu
+
+# ─── Environment defaults ─────────────────────────────────────────────────────
+ENV WHISPER_MODEL=small
+ENV GPU_MODELS="tiny base small"
+ENV VENV_PATH=/venv
+ENV WHISPER_CACHE=/whisper-cache
+# XDG_CACHE_HOME tells Whisper where to store downloaded model weights.
+# Must point to the host-mounted volume so weights persist across container restarts.
+ENV XDG_CACHE_HOME=/whisper-cache
+ENV WHISPER_BACKEND=openvino
+
+# ─── Port ─────────────────────────────────────────────────────────────────────
+EXPOSE 8000
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+CMD ["/venv/bin/uvicorn", "whisper_service:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1"]

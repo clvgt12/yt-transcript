@@ -1,0 +1,87 @@
+# yt-transcribe-web — Docker Compose
+#
+# NVIDIA CUDA Pascal architecture
+#
+# Services:
+#   ollama      — Ollama inference server (GPU-enabled, internal only)
+#   whisper     — Whisper transcription microservice (GPU-enabled, internal only)
+#   web         — Streamlit web application (port 8501)
+#
+# Internal network: yt-transcribe-net (ollama and whisper not exposed on host)
+#
+# Host mounts:
+#   ~/yt-transcribe/web/files    — transcription + summary output files
+#   ~/.cache                     — Whisper model weight cache (XDG_CACHE_HOME=/whisper-cache → whisper/*.pt)
+#   ollama Docker volume         — reuses existing cached Ollama models
+#
+# Usage:
+#   docker compose up -d --build
+#   open http://localhost:8501
+#
+# Environment:
+#   Create a .env file in this directory with:
+
+services:
+
+  # ── Ollama inference server (internal only) ─────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: yt-transcribe-web-ollama
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    volumes:
+      - ollama:/root/.ollama        # Reuse existing ollama volume with cached models
+    environment:
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-24576}
+      OLLAMA_NO_CLOUD:        ${OLLAMA_NO_CLOUD:-0}
+      OLLAMA_API_KEY:         ${OLLAMA_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # ── Whisper transcription microservice ─────────────────────────────────────
+  whisper:
+    build:
+      context: .
+      dockerfile: whisper/Dockerfile.cuda
+    image: yt-transcribe-whisper:latest
+    container_name: yt-transcribe-whisper
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    volumes:
+      - ${HOME}/.cache:/whisper-cache
+    environment:
+      WHISPER_MODEL:         ${WHISPER_MODEL:-small}
+      GPU_MODELS:            ${GPU_MODELS:-tiny base small}
+      JOB_TIMEOUT_SECONDS:   ${JOB_TIMEOUT_SECONDS:-600}
+      POLL_INTERVAL_MS:      ${POLL_INTERVAL_MS:-2000}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  ollama:
+    external: true              # Reuse existing ollama Docker volume

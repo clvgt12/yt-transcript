@@ -1,5 +1,17 @@
 """
-whisper-service — FastAPI microservice for audio transcription via OpenAI Whisper.
+whisper-service — FastAPI microservice for audio transcription via Whisper.
+
+Supports two interchangeable backends, selected via WHISPER_BACKEND:
+    cuda      — shells out to the `whisper` CLI (openai-whisper package),
+                --device cuda|cpu. Unchanged from the original kamakazi
+                implementation.
+    openvino  — in-process inference via optimum-intel's
+                OVModelForSpeechSeq2Seq, targeting OPENVINO_DEVICE
+                (GPU|CPU). Used on tepache's Intel iGPU.
+
+WHISPER_BACKEND defaults to "openvino" if OPENVINO_DEVICE is set, else
+"cuda" — but each Dockerfile should set it explicitly (ENV WHISPER_BACKEND=
+cuda / openvino) rather than relying on the fallback.
 
 API:
     POST /transcribe
@@ -17,6 +29,14 @@ API:
 
 Per-job watchdog: started on POST, reset on each GET poll, fires if no poll
 received within POLL_TIMEOUT_SECONDS — kills the whisper subprocess cleanly.
+
+Cancellation note (openvino backend only): a running OVModelForSpeechSeq2Seq
+.generate() call cannot be interrupted mid-inference the way a subprocess can
+be killed. Cancelling an openvino job marks it failed immediately for the
+client, but the underlying inference call keeps running in its background
+thread until it finishes — the result is simply discarded (see the
+job.status == "failed" check in transcribe_worker). This differs from the
+cuda backend, where cancellation kills the subprocess outright.
 """
 
 import os
@@ -53,11 +73,32 @@ VENV_PATH            = os.environ.get("VENV_PATH",           "/venv")
 WHISPER_CACHE        = os.environ.get("WHISPER_CACHE",       "/whisper-cache")
 JOB_TIMEOUT_SECONDS  = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
 
+# OpenVINO-specific (ignored by the cuda backend)
+OPENVINO_DEVICE      = os.environ.get("OPENVINO_DEVICE",     "CPU")
+
+# Backend selection — explicit env var wins; falls back to inferring from
+# OPENVINO_DEVICE only if WHISPER_BACKEND wasn't set. Set it explicitly in
+# each Dockerfile (ENV WHISPER_BACKEND=cuda / openvino) rather than relying
+# on this fallback.
+WHISPER_BACKEND = os.environ.get("WHISPER_BACKEND") or (
+    "openvino" if "OPENVINO_DEVICE" in os.environ else "cuda"
+)
+if WHISPER_BACKEND not in ("cuda", "openvino"):
+    raise RuntimeError(
+        f"Unsupported WHISPER_BACKEND: {WHISPER_BACKEND!r} "
+        f"(expected 'cuda' or 'openvino')"
+    )
+
 # Derive poll timeout from polling interval: 3 missed cycles + 1s margin
 _POLL_INTERVAL_MS    = int(os.environ.get("POLL_INTERVAL_MS", "2000"))
 POLL_TIMEOUT_SECONDS = (3 * _POLL_INTERVAL_MS // 1000) + 1
 
 Path(WHISPER_CACHE).mkdir(parents=True, exist_ok=True)
+
+log.info("whisper-service starting — backend=%s device=%s model=%s",
+         WHISPER_BACKEND,
+         OPENVINO_DEVICE if WHISPER_BACKEND == "openvino" else "cuda/cpu (per-model)",
+         WHISPER_MODEL)
 
 # ─── Per-job watchdog ─────────────────────────────────────────────────────────
 
@@ -138,7 +179,7 @@ class Job:
         self.error: Optional[str]      = None
         self.created_at  = datetime.now(UTC).isoformat()
         self.finished_at: Optional[str] = None
-        self.process: Optional[subprocess.Popen] = None
+        self.process: Optional[subprocess.Popen] = None   # cuda backend only
         self.watchdog: Optional[JobWatchdog]     = None
 
 
@@ -156,10 +197,31 @@ def store_job(job: Job):
         _jobs[job.job_id] = job
 
 
+# ─── Device resolution ─────────────────────────────────────────────────────────
+
+def resolve_device(model_name: str) -> str:
+    """
+    Which compute device a given model size should run on, for the active
+    backend. Mirrors the original GPU_MODELS logic: models in GPU_MODELS get
+    the accelerator; everything else (typically medium/large, which don't
+    fit in 4GB VRAM or a laptop iGPU's shared memory pool) falls back to CPU.
+    """
+    if WHISPER_BACKEND == "cuda":
+        return "cuda" if model_name in GPU_MODELS else "cpu"
+    else:  # openvino
+        return OPENVINO_DEVICE if model_name in GPU_MODELS else "CPU"
+
+
 # ─── Kill helper ──────────────────────────────────────────────────────────────
 
 def kill_job(job: Job, reason: str):
-    """Kill the whisper subprocess and mark job as failed."""
+    """
+    Mark a job failed and, for the cuda backend, kill its subprocess.
+    For the openvino backend there is no subprocess to kill — the in-process
+    generate() call is left to finish in its background thread and its
+    result is discarded once it notices job.status == "failed"
+    (see _transcribe_openvino's caller in transcribe_worker).
+    """
     proc = job.process
     if proc is not None:
         try:
@@ -176,57 +238,172 @@ def kill_job(job: Job, reason: str):
         job.watchdog.stop()
 
 
+# ─── CUDA backend — subprocess via the `whisper` CLI ──────────────────────────
+
+def _transcribe_cuda(job: Job, audio_path: Path):
+    """
+    Original kamakazi implementation, unchanged: shells out to the
+    openai-whisper CLI. Sets job.transcript/status directly (rather than
+    returning a value) because it needs to track job.process for
+    cancellation via kill_job().
+    """
+    device   = resolve_device(job.model)
+    out_dir  = audio_path.parent
+    activate = Path(VENV_PATH) / "bin" / "activate"
+
+    cmd = (
+        f"source {activate} && "
+        f"XDG_CACHE_HOME={WHISPER_CACHE} "
+        f"whisper '{audio_path}' "
+        f"--model {job.model} "
+        f"--device {device} "
+        f"--output_dir '{out_dir}' "
+        f"--output_format txt "
+        f"--verbose False"
+    )
+
+    job.process = subprocess.Popen(
+        cmd, shell=True, executable="/bin/bash",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    stdout, stderr = job.process.communicate()
+    result_rc   = job.process.returncode
+    job.process = None
+
+    # Check if killed by watchdog while communicate() was blocking
+    if job.status == "failed":
+        log.info("[%s] Job was cancelled during transcription", job.job_id[:8])
+        return
+
+    if result_rc != 0:
+        raise RuntimeError(stderr.strip() or "Whisper exited non-zero")
+
+    txts = list(out_dir.glob("*.txt"))
+    if not txts:
+        raise RuntimeError("Whisper produced no .txt output")
+
+    job.transcript  = txts[0].read_text(encoding="utf-8")
+    job.status      = "done"
+    job.finished_at = datetime.now(UTC).isoformat()
+    if job.watchdog:
+        job.watchdog.stop()
+    log.info("[%s] Transcription complete — %d chars",
+             job.job_id[:8], len(job.transcript))
+
+
+# ─── OpenVINO backend — in-process via optimum-intel ──────────────────────────
+
+# HF model repo IDs for each supported size. "large" maps to large-v3 (the
+# current recommended checkpoint) rather than the older large/large-v2.
+_HF_MODEL_IDS = {
+    "tiny":   "openai/whisper-tiny",
+    "base":   "openai/whisper-base",
+    "small":  "openai/whisper-small",
+    "medium": "openai/whisper-medium",
+    "large":  "openai/whisper-large-v3",
+}
+
+_ov_models_lock = threading.Lock()
+_ov_models: dict[str, tuple] = {}   # "{model}:{device}" -> (ov_model, processor)
+
+
+def _load_openvino_model(model_name: str, device: str):
+    """
+    Load (or fetch from the in-process cache) an OpenVINO-converted Whisper
+    model + processor. First load for a given model/device pair converts
+    from the HF checkpoint to OpenVINO IR and saves it under
+    WHISPER_CACHE/openvino-ir/ (which lives on the same bind-mounted volume
+    as the CUDA backend's .pt weights) so restarts reuse the converted model
+    instead of re-exporting — export is slow, several minutes for 'small'
+    and up on this hardware class.
+    """
+    # Imported here, not at module level, so the cuda image (which never
+    # installs optimum-intel/librosa) doesn't fail on import.
+    from optimum.intel.openvino import OVModelForSpeechSeq2Seq
+    from transformers import AutoProcessor
+
+    cache_key = f"{model_name}:{device}"
+    with _ov_models_lock:
+        if cache_key in _ov_models:
+            return _ov_models[cache_key]
+
+        hf_id = _HF_MODEL_IDS.get(model_name)
+        if hf_id is None:
+            raise ValueError(f"No OpenVINO model mapping for '{model_name}'")
+
+        ir_dir = Path(WHISPER_CACHE) / "openvino-ir" / f"{model_name}-{device.lower()}"
+
+        if ir_dir.exists():
+            log.info("[openvino] Loading cached IR for '%s' (%s) from %s",
+                      model_name, device, ir_dir)
+            model     = OVModelForSpeechSeq2Seq.from_pretrained(ir_dir, device=device)
+            processor = AutoProcessor.from_pretrained(ir_dir)
+        else:
+            log.info("[openvino] Converting '%s' (%s) to OpenVINO IR on device=%s "
+                      "— first run, this is slow", model_name, hf_id, device)
+            model     = OVModelForSpeechSeq2Seq.from_pretrained(
+                hf_id, export=True, device=device
+            )
+            processor = AutoProcessor.from_pretrained(hf_id)
+            ir_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(ir_dir)
+            processor.save_pretrained(ir_dir)
+            log.info("[openvino] Cached IR for '%s' (%s) at %s",
+                      model_name, device, ir_dir)
+
+        _ov_models[cache_key] = (model, processor)
+        return model, processor
+
+
+def _transcribe_openvino(job: Job, audio_path: Path):
+    """
+    In-process transcription via optimum-intel. Sets job.transcript/status
+    directly, mirroring _transcribe_cuda's contract, so transcribe_worker
+    can treat both backends identically.
+    """
+    import librosa
+
+    device = resolve_device(job.model)
+    model, processor = _load_openvino_model(job.model, device)
+
+    audio, _ = librosa.load(str(audio_path), sr=16000, mono=True)
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
+
+    predicted_ids = model.generate(inputs["input_features"])
+    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+
+    # Check if cancelled while generate() was blocking (see kill_job's
+    # docstring — the call itself can't be interrupted, so this is the
+    # earliest point we can notice and discard a stale result).
+    if job.status == "failed":
+        log.info("[%s] Job was cancelled during transcription", job.job_id[:8])
+        return
+
+    if not text:
+        raise RuntimeError("OpenVINO Whisper produced no output")
+
+    job.transcript  = text
+    job.status      = "done"
+    job.finished_at = datetime.now(UTC).isoformat()
+    if job.watchdog:
+        job.watchdog.stop()
+    log.info("[%s] Transcription complete — %d chars",
+             job.job_id[:8], len(job.transcript))
+
+
 # ─── Transcription worker ─────────────────────────────────────────────────────
 
 def transcribe_worker(job: Job, audio_path: Path):
-    """Run Whisper transcription in a background thread."""
+    """Run Whisper transcription in a background thread, dispatched by backend."""
     job.status = "running"
-    log.info("[%s] Starting transcription — model=%s file=%s",
-             job.job_id[:8], job.model, audio_path.name)
+    log.info("[%s] Starting transcription — backend=%s model=%s file=%s",
+             job.job_id[:8], WHISPER_BACKEND, job.model, audio_path.name)
 
     try:
-        device   = "cuda" if job.model in GPU_MODELS else "cpu"
-        out_dir  = audio_path.parent
-        activate = Path(VENV_PATH) / "bin" / "activate"
-
-        cmd = (
-            f"source {activate} && "
-            f"XDG_CACHE_HOME={WHISPER_CACHE} "
-            f"whisper '{audio_path}' "
-            f"--model {job.model} "
-            f"--device {device} "
-            f"--output_dir '{out_dir}' "
-            f"--output_format txt "
-            f"--verbose False"
-        )
-
-        job.process = subprocess.Popen(
-            cmd, shell=True, executable="/bin/bash",
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        stdout, stderr = job.process.communicate()
-        result_rc  = job.process.returncode
-        job.process = None
-
-        # Check if killed by watchdog while communicate() was blocking
-        if job.status == "failed":
-            log.info("[%s] Job was cancelled during transcription", job.job_id[:8])
-            return
-
-        if result_rc != 0:
-            raise RuntimeError(stderr.strip() or "Whisper exited non-zero")
-
-        txts = list(out_dir.glob("*.txt"))
-        if not txts:
-            raise RuntimeError("Whisper produced no .txt output")
-
-        job.transcript  = txts[0].read_text(encoding="utf-8")
-        job.status      = "done"
-        job.finished_at = datetime.now(UTC).isoformat()
-        if job.watchdog:
-            job.watchdog.stop()
-        log.info("[%s] Transcription complete — %d chars",
-                 job.job_id[:8], len(job.transcript))
+        if WHISPER_BACKEND == "cuda":
+            _transcribe_cuda(job, audio_path)
+        else:
+            _transcribe_openvino(job, audio_path)
 
     except Exception as exc:
         if job.status != "failed":   # don't overwrite watchdog-set status
@@ -251,8 +428,8 @@ def transcribe_worker(job: Job, audio_path: Path):
 
 app = FastAPI(
     title="whisper-service",
-    description="Async audio transcription via OpenAI Whisper",
-    version="1.0.0",
+    description="Async audio transcription via Whisper (cuda or openvino backend)",
+    version="1.1.0",
 )
 
 
@@ -282,9 +459,10 @@ class JobStatusResponse(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "model":  WHISPER_MODEL,
-        "device": "cuda" if WHISPER_MODEL in GPU_MODELS else "cpu",
+        "status":  "ok",
+        "backend": WHISPER_BACKEND,
+        "model":   WHISPER_MODEL,
+        "device":  resolve_device(WHISPER_MODEL),
     }
 
 

@@ -1034,7 +1034,10 @@ def run_workflow(job: Job):
                     audio_path_str = data.get("audio_path")
                     if not audio_path_str:
                         raise RuntimeError("Audio download failed — no path returned.")
-                    mp3s = [Path(audio_path_str)]
+                    # Don't trust ytdlp's absolute path — it's from a different mount
+                    # namespace. Take just the filename and rejoin under our own FILES_BASE.
+                    audio_filename = Path(audio_path_str).name
+                    mp3s = [FILES_BASE / video_id / audio_filename]
                     job.log(f"Audio downloaded: {mp3s[0].name}")
                 else:
                     job.log(f"Using cached audio: {mp3s[0].name}")

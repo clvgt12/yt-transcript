@@ -17,12 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     ocl-icd-libopencl1 \
     intel-opencl-icd \
-    intel-level-zero-gpu \
-    level-zero \
+    libze-intel-gpu1 \
+    libze1 \
     && rm -rf /var/lib/apt/lists/*
-    
-# ─── Set up OpenVINO compute stack ────────────────────────────────────────────
-RUN usermod -a -G render ubuntu
 
 # ─── Python virtual environment ───────────────────────────────────────────────
 RUN python3 -m venv /venv

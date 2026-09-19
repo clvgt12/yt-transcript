@@ -25,10 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && deno --version
 
-# ─── Install yt-dlp via pip (includes EJS scripts needed for Deno runtime) ────
-# Note: standalone binary does NOT include EJS scripts — pip install required
-RUN pip install --no-cache-dir --break-system-packages "yt-dlp[default]"
-
 # ─── Python virtual environment ───────────────────────────────────────────────
 RUN python3 -m venv /venv
 ENV PATH="/venv/bin:/usr/local/bin:$PATH"
@@ -42,8 +38,6 @@ WORKDIR /app
 COPY ytdlp_service.py /app/ytdlp_service.py
 
 # ─── Output directory (shared host mount) ─────────────────────────────────────
-RUN mkdir -p /files && chown ubuntu:ubuntu /files
-
 VOLUME ["/files"]
 
 # ─── Set ownership of app and venv ────────────────────────────────────────────
@@ -53,7 +47,7 @@ RUN chown -R ubuntu:ubuntu /app /venv /home/ubuntu
 USER ubuntu
 
 # ─── Environment defaults ─────────────────────────────────────────────────────
-ENV YT_DLP_BIN=/usr/local/bin/yt-dlp
+ENV YT_DLP_BIN=/venv/bin/yt-dlp
 ENV FILES_BASE=/files
 ENV JOB_TIMEOUT_SECONDS=300
 ENV POLL_INTERVAL_MS=2000

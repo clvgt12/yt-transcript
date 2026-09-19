@@ -37,7 +37,7 @@ services:
     volumes:
       - ${HOME}/yt-transcribe/web/files:/files
     environment:
-      YT_DLP_BIN:          /usr/local/bin/yt-dlp
+      YT_DLP_BIN:          /venv/bin/yt-dlp
       FILES_BASE:          /files
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
       POLL_INTERVAL_MS:    ${POLL_INTERVAL_MS:-2000}

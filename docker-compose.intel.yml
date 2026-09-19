@@ -68,6 +68,7 @@ services:
       JOB_TIMEOUT_SECONDS:   ${JOB_TIMEOUT_SECONDS:-600}
       POLL_INTERVAL_MS:      ${POLL_INTERVAL_MS:-2000}
       OPENVINO_DEVICE:       GPU
+      TARGET_LANG:           ${TARGET_LANG:-auto}
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 15s

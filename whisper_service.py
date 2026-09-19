@@ -73,6 +73,19 @@ VENV_PATH            = os.environ.get("VENV_PATH",           "/venv")
 WHISPER_CACHE        = os.environ.get("WHISPER_CACHE",       "/whisper-cache")
 JOB_TIMEOUT_SECONDS  = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
 
+# Whisper supports exactly two modes: "auto" (transcribe in the detected
+# source language) or "en" (translate — Whisper only ever translates TO
+# English, never to an arbitrary target language; that's a hard model
+# limitation, not a config option). Any other value would silently force
+# transcription to assume the wrong source language rather than translate
+# anything, so it's rejected here rather than passed through.
+TARGET_LANG = os.environ.get("TARGET_LANG", "auto").strip().lower()
+if TARGET_LANG not in ("auto", "en"):
+    log.warning("TARGET_LANG=%r is not supported (Whisper can only "
+                "auto-detect/transcribe or translate to English) — "
+                "falling back to 'auto'", TARGET_LANG)
+    TARGET_LANG = "auto"
+
 # OpenVINO-specific (ignored by the cuda backend)
 OPENVINO_DEVICE      = os.environ.get("OPENVINO_DEVICE",     "CPU")
 
@@ -251,12 +264,18 @@ def _transcribe_cuda(job: Job, audio_path: Path):
     out_dir  = audio_path.parent
     activate = Path(VENV_PATH) / "bin" / "activate"
 
+    # TARGET_LANG="en" -> Whisper's translate task (any source language ->
+    # English). "auto" -> default transcribe task, no flag needed; Whisper
+    # already auto-detects the source language on its own.
+    task_flag = "--task translate " if TARGET_LANG == "en" else ""
+
     cmd = (
         f"source {activate} && "
         f"XDG_CACHE_HOME={WHISPER_CACHE} "
         f"whisper '{audio_path}' "
         f"--model {job.model} "
         f"--device {device} "
+        f"{task_flag}"
         f"--output_dir '{out_dir}' "
         f"--output_format txt "
         f"--verbose False"
@@ -388,7 +407,10 @@ def _transcribe_openvino(job: Job, audio_path: Path):
         if job.status == "failed":
             log.info("[%s] Job was cancelled while waiting for GPU", job.job_id[:8])
             return
-        predicted_ids = model.generate(inputs["input_features"])
+        # TARGET_LANG="en" -> translate (any source language -> English).
+        # "auto" -> default transcribe, source language auto-detected.
+        gen_kwargs = {"task": "translate"} if TARGET_LANG == "en" else {}
+        predicted_ids = model.generate(inputs["input_features"], **gen_kwargs)
     finally:
         _ov_inference_lock.release()
 
@@ -481,10 +503,11 @@ class JobStatusResponse(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":  "ok",
-        "backend": WHISPER_BACKEND,
-        "model":   WHISPER_MODEL,
-        "device":  resolve_device(WHISPER_MODEL),
+        "status":      "ok",
+        "backend":     WHISPER_BACKEND,
+        "model":       WHISPER_MODEL,
+        "device":      resolve_device(WHISPER_MODEL),
+        "target_lang": TARGET_LANG,
     }
 
 

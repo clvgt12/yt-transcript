@@ -67,6 +67,7 @@ services:
       GPU_MODELS:            ${GPU_MODELS:-tiny base small}
       JOB_TIMEOUT_SECONDS:   ${JOB_TIMEOUT_SECONDS:-600}
       POLL_INTERVAL_MS:      ${POLL_INTERVAL_MS:-2000}
+      TARGET_LANG:           ${TARGET_LANG:-auto}
     deploy:
       resources:
         reservations:

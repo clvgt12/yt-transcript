@@ -1,4 +1,4 @@
-# whisper-service Dockerfile
+# whisper-service Dockerfile - NVIDIA CUDA Pascal architecture
 # Base: nvidia/cuda 12.6 runtime on Ubuntu 24.04
 #   - Matches kamakazi host OS (Ubuntu 24.04 LTS)
 #   - Host driver 580.x / CUDA 13 supports any container CUDA <= 13
@@ -7,7 +7,7 @@
 FROM nvidia/cuda:12.6.0-runtime-ubuntu24.04
 
 LABEL maintainer="chris@kamakazi"
-LABEL description="OpenAI Whisper transcription microservice (FastAPI + async)"
+LABEL description="OpenAI Whisper transcription microservice (FastAPI + async) - NVIDIA CUDA Pascal architecture"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -34,16 +34,22 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu118
 
 # ─── Remaining Python dependencies from PyPI ─────────────────────────────────
-COPY whisper_requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY ./whisper/requirements-cuda.txt /tmp/requirements-cuda.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-cuda.txt
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY whisper_service.py /app/whisper_service.py
+COPY whisper/whisper_service.py /app/whisper_service.py
 
 # ─── Whisper model cache directory ───────────────────────────────────────────
 RUN mkdir -p /whisper-cache
 VOLUME ["/whisper-cache"]
+
+# ─── Set ownership of app and venv ────────────────────────────────────────────
+RUN chown -R ubuntu:ubuntu /app /venv /whisper-cache /home/ubuntu
+
+# ─── Switch to non-root user ──────────────────────────────────────────────────
+USER ubuntu
 
 # ─── Environment defaults ─────────────────────────────────────────────────────
 ENV WHISPER_MODEL=small
@@ -53,6 +59,7 @@ ENV WHISPER_CACHE=/whisper-cache
 # XDG_CACHE_HOME tells Whisper where to store downloaded model weights.
 # Must point to the host-mounted volume so weights persist across container restarts.
 ENV XDG_CACHE_HOME=/whisper-cache
+ENV WHISPER_BACKEND=cuda
 
 # ─── Port ─────────────────────────────────────────────────────────────────────
 EXPOSE 8000

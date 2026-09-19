@@ -73,19 +73,6 @@ VENV_PATH            = os.environ.get("VENV_PATH",           "/venv")
 WHISPER_CACHE        = os.environ.get("WHISPER_CACHE",       "/whisper-cache")
 JOB_TIMEOUT_SECONDS  = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
 
-# Whisper supports exactly two modes: "auto" (transcribe in the detected
-# source language) or "en" (translate — Whisper only ever translates TO
-# English, never to an arbitrary target language; that's a hard model
-# limitation, not a config option). Any other value would silently force
-# transcription to assume the wrong source language rather than translate
-# anything, so it's rejected here rather than passed through.
-TARGET_LANG = os.environ.get("TARGET_LANG", "auto").strip().lower()
-if TARGET_LANG not in ("auto", "en"):
-    log.warning("TARGET_LANG=%r is not supported (Whisper can only "
-                "auto-detect/transcribe or translate to English) — "
-                "falling back to 'auto'", TARGET_LANG)
-    TARGET_LANG = "auto"
-
 # OpenVINO-specific (ignored by the cuda backend)
 OPENVINO_DEVICE      = os.environ.get("OPENVINO_DEVICE",     "CPU")
 
@@ -264,18 +251,12 @@ def _transcribe_cuda(job: Job, audio_path: Path):
     out_dir  = audio_path.parent
     activate = Path(VENV_PATH) / "bin" / "activate"
 
-    # TARGET_LANG="en" -> Whisper's translate task (any source language ->
-    # English). "auto" -> default transcribe task, no flag needed; Whisper
-    # already auto-detects the source language on its own.
-    task_flag = "--task translate " if TARGET_LANG == "en" else ""
-
     cmd = (
         f"source {activate} && "
         f"XDG_CACHE_HOME={WHISPER_CACHE} "
         f"whisper '{audio_path}' "
         f"--model {job.model} "
         f"--device {device} "
-        f"{task_flag}"
         f"--output_dir '{out_dir}' "
         f"--output_format txt "
         f"--verbose False"
@@ -324,14 +305,6 @@ _HF_MODEL_IDS = {
 
 _ov_models_lock = threading.Lock()
 _ov_models: dict[str, tuple] = {}   # "{model}:{device}" -> (ov_model, processor)
-
-# OpenVINO's GPU plugin is not safe for concurrent inference calls sharing
-# one device context — two simultaneous generate() calls have been observed
-# to hang the entire process (not just the two jobs involved), consistent
-# with the native blocking wait not releasing the GIL. There's only one
-# physical GPU regardless of which model size is in use, so this lock is
-# global across all models/devices, not per cache_key.
-_ov_inference_lock = threading.Lock()
 
 
 def _load_openvino_model(model_name: str, device: str):
@@ -396,24 +369,7 @@ def _transcribe_openvino(job: Job, audio_path: Path):
     audio, _ = librosa.load(str(audio_path), sr=16000, mono=True)
     inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
 
-    # Serialize the actual GPU call — see _ov_inference_lock's comment.
-    # Audio decode/preprocessing above happens outside the lock so it can
-    # overlap with another job's inference.
-    if not _ov_inference_lock.acquire(blocking=False):
-        log.info("[%s] Waiting for GPU (another transcription in progress)...",
-                 job.job_id[:8])
-        _ov_inference_lock.acquire()
-    try:
-        if job.status == "failed":
-            log.info("[%s] Job was cancelled while waiting for GPU", job.job_id[:8])
-            return
-        # TARGET_LANG="en" -> translate (any source language -> English).
-        # "auto" -> default transcribe, source language auto-detected.
-        gen_kwargs = {"task": "translate"} if TARGET_LANG == "en" else {}
-        predicted_ids = model.generate(inputs["input_features"], **gen_kwargs)
-    finally:
-        _ov_inference_lock.release()
-
+    predicted_ids = model.generate(inputs["input_features"])
     text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
 
     # Check if cancelled while generate() was blocking (see kill_job's
@@ -503,11 +459,10 @@ class JobStatusResponse(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":      "ok",
-        "backend":     WHISPER_BACKEND,
-        "model":       WHISPER_MODEL,
-        "device":      resolve_device(WHISPER_MODEL),
-        "target_lang": TARGET_LANG,
+        "status":  "ok",
+        "backend": WHISPER_BACKEND,
+        "model":   WHISPER_MODEL,
+        "device":  resolve_device(WHISPER_MODEL),
     }
 
 

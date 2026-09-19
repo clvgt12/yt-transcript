@@ -1,9 +1,8 @@
-# ytdlp-service Dockerfile
-# Base: Ubuntu 24.04 LTS — matches kamakazi host OS, no GPU needed
+# whisper-service Dockerfile - Intel OpenVINO architecture
 FROM ubuntu:24.04
 
 LABEL maintainer="chris@kamakazi"
-LABEL description="yt-dlp download microservice (FastAPI + async + per-job watchdog)"
+LABEL description="OpenAI Whisper transcription microservice (FastAPI + async) - Intel OpenVINO architecture"
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -14,49 +13,59 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     python3-dev \
     ffmpeg \
-    wget \
     curl \
     ca-certificates \
-    unzip \
+    ocl-icd-libopencl1 \
+    intel-opencl-icd \
+    libze-intel-gpu1 \
+    libze1 \
     && rm -rf /var/lib/apt/lists/*
-
-# ─── Install Deno (JS runtime required by yt-dlp for YouTube extraction) ──────
-# Must run as root before USER switch so it installs to /usr/local/bin
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
-    && deno --version
 
 # ─── Python virtual environment ───────────────────────────────────────────────
 RUN python3 -m venv /venv
-ENV PATH="/venv/bin:/usr/local/bin:$PATH"
+ENV PATH="/venv/bin:$PATH"
 
-# ─── Python dependencies ──────────────────────────────────────────────────────
-COPY ytdlp_requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# ─── Install Intel OpenVINO Python libraries  ───────────────────────────────
+RUN pip install --no-cache-dir \
+    optimum[openvino] \
+    "datasets<4" \
+    librosa \
+    soundfile \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+# ─── Remaining Python dependencies from PyPI ─────────────────────────────────
+COPY ./whisper/requirements-openvino.txt /tmp/requirements-openvino.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-openvino.txt
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY ytdlp_service.py /app/ytdlp_service.py
+COPY whisper/whisper_service.py /app/whisper_service.py
 
-# ─── Output directory (shared host mount) ─────────────────────────────────────
-VOLUME ["/files"]
+# ─── Whisper model cache directory ───────────────────────────────────────────
+RUN mkdir -p /whisper-cache
+VOLUME ["/whisper-cache"]
 
 # ─── Set ownership of app and venv ────────────────────────────────────────────
-RUN chown -R ubuntu:ubuntu /app /venv /home/ubuntu
+RUN chown -R ubuntu:ubuntu /app /venv /whisper-cache /home/ubuntu
 
 # ─── Switch to non-root user ──────────────────────────────────────────────────
 USER ubuntu
 
 # ─── Environment defaults ─────────────────────────────────────────────────────
-ENV YT_DLP_BIN=/venv/bin/yt-dlp
-ENV FILES_BASE=/files
-ENV JOB_TIMEOUT_SECONDS=300
-ENV POLL_INTERVAL_MS=2000
+ENV WHISPER_MODEL=small
+ENV GPU_MODELS="tiny base small"
+ENV VENV_PATH=/venv
+ENV WHISPER_CACHE=/whisper-cache
+# XDG_CACHE_HOME tells Whisper where to store downloaded model weights.
+# Must point to the host-mounted volume so weights persist across container restarts.
+ENV XDG_CACHE_HOME=/whisper-cache
+ENV WHISPER_BACKEND=openvino
 
 # ─── Port ─────────────────────────────────────────────────────────────────────
-EXPOSE 8001
+EXPOSE 8000
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
-CMD ["/venv/bin/uvicorn", "ytdlp_service:app", \
+CMD ["/venv/bin/uvicorn", "whisper_service:app", \
      "--host", "0.0.0.0", \
-     "--port", "8001", \
+     "--port", "8000", \
      "--workers", "1"]

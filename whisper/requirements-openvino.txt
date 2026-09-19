@@ -1,0 +1,5 @@
+# whisper-service Python dependencies -- Intel OpenVINO architecture
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

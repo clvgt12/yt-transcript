@@ -347,7 +347,7 @@ def _load_openvino_model(model_name: str, device: str):
     # Imported here, not at module level, so the cuda image (which never
     # installs optimum-intel/librosa) doesn't fail on import.
     from optimum.intel.openvino import OVModelForSpeechSeq2Seq
-    from transformers import AutoProcessor
+    from transformers import AutoConfig, AutoProcessor
 
     cache_key = f"{model_name}:{device}"
     with _ov_models_lock:
@@ -363,7 +363,8 @@ def _load_openvino_model(model_name: str, device: str):
         if ir_dir.exists():
             log.info("[openvino] Loading cached IR for '%s' (%s) from %s",
                       model_name, device, ir_dir)
-            model     = OVModelForSpeechSeq2Seq.from_pretrained(ir_dir, device=device)
+            config    = AutoConfig.from_pretrained(ir_dir)
+            model     = OVModelForSpeechSeq2Seq.from_pretrained(ir_dir, config=config, device=device)
             processor = AutoProcessor.from_pretrained(ir_dir)
         else:
             log.info("[openvino] Converting '%s' (%s) to OpenVINO IR on device=%s "

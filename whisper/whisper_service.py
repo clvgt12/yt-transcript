@@ -73,6 +73,19 @@ VENV_PATH            = os.environ.get("VENV_PATH",           "/venv")
 WHISPER_CACHE        = os.environ.get("WHISPER_CACHE",       "/whisper-cache")
 JOB_TIMEOUT_SECONDS  = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
 
+# Whisper supports exactly two modes: "auto" (transcribe in the detected
+# source language) or "en" (translate — Whisper only ever translates TO
+# English, never to an arbitrary target language; that's a hard model
+# limitation, not a config option). Any other value would silently force
+# transcription to assume the wrong source language rather than translate
+# anything, so it's rejected here rather than passed through.
+TARGET_LANG = os.environ.get("TARGET_LANG", "auto").strip().lower()
+if TARGET_LANG not in ("auto", "en"):
+    log.warning("TARGET_LANG=%r is not supported (Whisper can only "
+                "auto-detect/transcribe or translate to English) — "
+                "falling back to 'auto'", TARGET_LANG)
+    TARGET_LANG = "auto"
+
 # OpenVINO-specific (ignored by the cuda backend)
 OPENVINO_DEVICE      = os.environ.get("OPENVINO_DEVICE",     "CPU")
 
@@ -251,12 +264,18 @@ def _transcribe_cuda(job: Job, audio_path: Path):
     out_dir  = audio_path.parent
     activate = Path(VENV_PATH) / "bin" / "activate"
 
+    # TARGET_LANG="en" -> Whisper's translate task (any source language ->
+    # English). "auto" -> default transcribe task, no flag needed; Whisper
+    # already auto-detects the source language on its own.
+    task_flag = "--task translate " if TARGET_LANG == "en" else ""
+
     cmd = (
         f"source {activate} && "
         f"XDG_CACHE_HOME={WHISPER_CACHE} "
         f"whisper '{audio_path}' "
         f"--model {job.model} "
         f"--device {device} "
+        f"{task_flag}"
         f"--output_dir '{out_dir}' "
         f"--output_format txt "
         f"--verbose False"
@@ -305,6 +324,14 @@ _HF_MODEL_IDS = {
 
 _ov_models_lock = threading.Lock()
 _ov_models: dict[str, tuple] = {}   # "{model}:{device}" -> (ov_model, processor)
+
+# OpenVINO's GPU plugin is not safe for concurrent inference calls sharing
+# one device context — two simultaneous generate() calls have been observed
+# to hang the entire process (not just the two jobs involved), consistent
+# with the native blocking wait not releasing the GIL. There's only one
+# physical GPU regardless of which model size is in use, so this lock is
+# global across all models/devices, not per cache_key.
+_ov_inference_lock = threading.Lock()
 
 
 def _load_openvino_model(model_name: str, device: str):
@@ -355,6 +382,43 @@ def _load_openvino_model(model_name: str, device: str):
         return model, processor
 
 
+# Windowing parameters for OpenVINO long-form transcription (see
+# _transcribe_openvino for why we window manually).
+_OV_WINDOW_S     = 30     # Whisper's fixed receptive field
+_OV_SEARCH_S     = 5      # look back this far from each 30 s mark for a quiet cut
+_OV_FRAME_S      = 0.02   # 20 ms RMS frames for the quiet-point search
+_OV_SILENCE_RMS  = 1e-3   # windows quieter than this are skipped entirely
+
+
+def _split_on_quiet(audio: "np.ndarray", sr: int = 16000) -> list:
+    """
+    Split audio into consecutive, non-overlapping windows of at most
+    _OV_WINDOW_S seconds. Each cut is placed at the quietest 20 ms frame in
+    the last _OV_SEARCH_S seconds before the 30 s limit, which usually lands
+    between words, so boundaries rarely clip speech. No overlap means no
+    duplicate text to de-duplicate when the windows are joined.
+    """
+    import numpy as np   # openvino image only; see librosa import note
+    max_len = _OV_WINDOW_S * sr
+    search  = _OV_SEARCH_S * sr
+    frame   = max(1, int(_OV_FRAME_S * sr))
+    n, start, windows = len(audio), 0, []
+
+    while start < n:
+        end = min(start + max_len, n)
+        if end < n:
+            lo  = end - search
+            seg = audio[lo:end]
+            usable = (len(seg) // frame) * frame
+            rms = np.sqrt(np.mean(seg[:usable].reshape(-1, frame) ** 2, axis=1))
+            end = lo + int(np.argmin(rms)) * frame + frame // 2
+        # Drop sub-0.5 s slivers at the tail; nothing useful to decode there.
+        if end - start >= sr // 2 or not windows:
+            windows.append(audio[start:end])
+        start = end
+    return windows
+
+
 def _transcribe_openvino(job: Job, audio_path: Path):
     """
     In-process transcription via optimum-intel. Sets job.transcript/status
@@ -362,15 +426,70 @@ def _transcribe_openvino(job: Job, audio_path: Path):
     can treat both backends identically.
     """
     import librosa
+    import numpy as np
 
     device = resolve_device(job.model)
     model, processor = _load_openvino_model(job.model, device)
 
     audio, _ = librosa.load(str(audio_path), sr=16000, mono=True)
-    inputs = processor(audio, sampling_rate=16000, return_tensors="pt")
+    duration_s = len(audio) / 16000
+    log.info("[%s] Audio duration: %.1fs", job.job_id[:8], duration_s)
 
-    predicted_ids = model.generate(inputs["input_features"])
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+    # Whisper's receptive field is 30 s, and the processor pads/TRUNCATES
+    # every input to exactly 30 s by default — the original "stops after
+    # the first minute" bug. Transformers' built-in long-form path
+    # (truncation=False + return_timestamps=True) is NOT usable here:
+    # optimum-intel's _OVModelForWhisper overrides
+    # prepare_inputs_for_generation() with a signature the long-form code
+    # path doesn't satisfy, and it crashes with "missing 1 required
+    # positional argument: 'decoder_input_ids'". So we do our own windowing:
+    # split at quiet points into <=30 s windows and run the proven
+    # short-form generate() on each one.
+    windows = _split_on_quiet(audio, sr=16000)
+    log.info("[%s] Split into %d window(s) of <=%ds",
+             job.job_id[:8], len(windows), _OV_WINDOW_S)
+
+    # TARGET_LANG="en" -> translate (any source language -> English).
+    # "auto" -> transcribe, source language auto-detected per window.
+    # task is passed explicitly in both cases; never pass language= here,
+    # since that asserts the SOURCE language, which isn't what TARGET_LANG means.
+    gen_kwargs = {"task": "translate" if TARGET_LANG == "en" else "transcribe"}
+
+    pieces = []
+    for i, win in enumerate(windows, 1):
+        # Skip near-silent windows: Whisper (esp. tiny) tends to hallucinate
+        # filler like "Thank you." on silence.
+        if float(np.sqrt(np.mean(win ** 2))) < _OV_SILENCE_RMS:
+            log.info("[%s] Window %d/%d silent — skipped", job.job_id[:8], i, len(windows))
+            continue
+
+        # Preprocess outside the lock so it can overlap another job's inference.
+        inputs = processor(win, sampling_rate=16000, return_tensors="pt")
+
+        # Serialize the actual GPU call — see _ov_inference_lock's comment.
+        # The lock is taken per window rather than per job, so a queued job
+        # isn't starved behind one long video, and a cancel takes effect
+        # within one window (a few seconds) instead of after the whole file.
+        if not _ov_inference_lock.acquire(blocking=False):
+            log.info("[%s] Waiting for GPU (another transcription in progress)...",
+                     job.job_id[:8])
+            _ov_inference_lock.acquire()
+        try:
+            if job.status == "failed":
+                log.info("[%s] Job was cancelled at window %d/%d",
+                         job.job_id[:8], i, len(windows))
+                return
+            predicted_ids = model.generate(inputs["input_features"], **gen_kwargs)
+        finally:
+            _ov_inference_lock.release()
+
+        piece = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        if piece:
+            pieces.append(piece)
+        log.info("[%s] Window %d/%d done (%d chars)",
+                 job.job_id[:8], i, len(windows), len(piece))
+
+    text = " ".join(pieces).strip()
 
     # Check if cancelled while generate() was blocking (see kill_job's
     # docstring — the call itself can't be interrupted, so this is the
@@ -381,6 +500,15 @@ def _transcribe_openvino(job: Job, audio_path: Path):
 
     if not text:
         raise RuntimeError("OpenVINO Whisper produced no output")
+
+    # Guardrail against silent truncation regressions: conversational
+    # speech runs ~12-18 chars/s. Well under that on long audio usually
+    # means most of the file was never decoded.
+    cps = len(text) / duration_s if duration_s else 0.0
+    if duration_s > 60 and cps < 5:
+        log.warning("[%s] Low transcript density: %d chars for %.0fs audio "
+                    "(%.1f chars/s) — possible truncation",
+                    job.job_id[:8], len(text), duration_s, cps)
 
     job.transcript  = text
     job.status      = "done"
@@ -459,10 +587,11 @@ class JobStatusResponse(BaseModel):
 @app.get("/health")
 def health():
     return {
-        "status":  "ok",
-        "backend": WHISPER_BACKEND,
-        "model":   WHISPER_MODEL,
-        "device":  resolve_device(WHISPER_MODEL),
+        "status":      "ok",
+        "backend":     WHISPER_BACKEND,
+        "model":       WHISPER_MODEL,
+        "device":      resolve_device(WHISPER_MODEL),
+        "target_lang": TARGET_LANG,
     }
 
 

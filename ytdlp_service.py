@@ -58,6 +58,18 @@ JOB_TIMEOUT_SECONDS = int(os.environ.get("JOB_TIMEOUT_SECONDS", "300"))  # 5 min
 _POLL_INTERVAL_MS   = int(os.environ.get("POLL_INTERVAL_MS",    "2000"))
 POLL_TIMEOUT_SECONDS = (3 * _POLL_INTERVAL_MS // 1000) + 1
 
+# Subtitle language selection.
+#   Human subs: manual captions are not affected by YouTube's timedtext 429
+#   throttling. skip=translated_subs keeps yt-dlp from choosing a translated
+#   manual track.
+#   Auto subs: request ONLY the native ASR track ("en-orig"). Since late
+#   Sep 2026, plain "en" on many videos (e.g. auto-dubbed ones) resolves to a
+#   machine translation (timedtext ...&tlang=en) of another ASR track, which
+#   YouTube answers with HTTP 429. Non-English videos have no en-orig and
+#   fall back to Whisper (see whisper-service TARGET_LANG).
+HUMAN_SUB_LANGS = ["en", "en-US", "en-GB"]
+AUTO_SUB_LANGS  = ["en-orig"]
+
 FILES_BASE.mkdir(parents=True, exist_ok=True)
 
 # ─── Per-job watchdog ─────────────────────────────────────────────────────────
@@ -210,8 +222,7 @@ def _cleanup_media(video_id: str):
     if not out_dir.is_dir():
         return
     removed = []
-    for pattern in ("*.mp3", "*.webm", "*.m4a", "*.part", "*.ytdl",
-                    "*.vtt", "*.en.vtt"):
+    for pattern in ("*.mp3", "*.webm", "*.m4a", "*.part", "*.ytdl", "*.vtt"):
         for f in out_dir.glob(pattern):
             try:
                 f.unlink()
@@ -289,6 +300,55 @@ def _run_cmd(job: Job, cmd: list) -> tuple[int, str, str]:
     return rc, stdout.strip(), stderr.strip()
 
 
+def _fetch_subs(job: Job, out_dir: Path, *, auto: bool) -> Optional[Path]:
+    """
+    Download English subtitles for job.video_id and return the .vtt path,
+    or None if unavailable. Never raises for a missing/blocked track — it
+    logs WHY (HTTP 429, other yt-dlp error, or simply not available) so the
+    caller can fall back to Whisper. Returns None if the job was cancelled;
+    callers must check job.status.
+    """
+    video_id = job.video_id
+    langs    = AUTO_SUB_LANGS if auto else HUMAN_SUB_LANGS
+    kind     = "auto" if auto else "human"
+
+    # Clear leftovers so a stale file can't masquerade as a fresh download
+    for stale in out_dir.glob(f"{video_id}.*.vtt"):
+        stale.unlink(missing_ok=True)
+
+    cmd = [YT_DLP_BIN, "--skip-download",
+           "--write-auto-subs" if auto else "--write-subs",
+           "--sub-langs", ",".join(langs), "--sub-format", "vtt",
+           # ID-based filename: immune to title sanitization (e.g. '：')
+           "--output", str(out_dir / "%(id)s.%(ext)s")]
+    if not auto:
+        cmd += ["--extractor-args", "youtube:skip=translated_subs"]
+    cmd += ["--", f"https://www.youtube.com/watch?v={video_id}"]
+
+    rc, _, stderr = _run_cmd(job, cmd)
+    if job.status == "failed":
+        return None
+
+    # First match in preference order
+    for lang in langs:
+        p = out_dir / f"{video_id}.{lang}.vtt"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+
+    # No file — say why instead of failing silently
+    if "429" in stderr:
+        log.warning("[%s] %s subtitles rate-limited by YouTube (HTTP 429)",
+                    job.job_id[:8], kind)
+    elif rc != 0:
+        tail = " | ".join(stderr.strip().splitlines()[-3:])
+        log.warning("[%s] %s subtitle fetch failed rc=%s: %s",
+                    job.job_id[:8], kind, rc, tail[:300])
+    else:
+        log.info("[%s] No %s subtitles available (%s)",
+                 job.job_id[:8], kind, ",".join(langs))
+    return None
+
+
 def download_worker(job: Job):
     """Execute requested download operations sequentially."""
     job.status = "running"
@@ -334,37 +394,27 @@ def download_worker(job: Job):
 
         # ── 2. Human subtitles ────────────────────────────────────────────────
         if job.human:
-            rc, _, _ = _run_cmd(job, [
-                YT_DLP_BIN, "--skip-download", "--write-subs",
-                "--sub-lang", "en", "--sub-format", "vtt",
-                "--output", str(out_dir / "%(title)s.%(ext)s"),
-                f"https://www.youtube.com/watch?v={video_id}"
-            ])
+            vtt = _fetch_subs(job, out_dir, auto=False)
             if job.status == "failed":
                 return
-            vtts = [f for f in out_dir.glob("*.en.vtt") if "live_chat" not in f.name]
-            if vtts:
-                job.transcript      = vtt_to_text(vtts[0])
+            if vtt:
+                job.transcript      = vtt_to_text(vtt)
                 job.subtitle_source = "human"
-                vtts[0].unlink(missing_ok=True)
-                log.info("[%s] Human subtitles downloaded", job.job_id[:8])
+                vtt.unlink(missing_ok=True)
+                log.info("[%s] Human subtitles downloaded (%s)",
+                         job.job_id[:8], vtt.name)
 
-        # ── 3. Auto-generated subtitles ───────────────────────────────────────
+        # ── 3. Auto-generated subtitles (native ASR track only) ───────────────
         if job.auto and not job.transcript:
-            rc, _, _ = _run_cmd(job, [
-                YT_DLP_BIN, "--skip-download", "--write-auto-subs",
-                "--sub-lang", "en", "--sub-format", "vtt",
-                "--output", str(out_dir / "%(title)s.%(ext)s"),
-                f"https://www.youtube.com/watch?v={video_id}"
-            ])
+            vtt = _fetch_subs(job, out_dir, auto=True)
             if job.status == "failed":
                 return
-            vtts = [f for f in out_dir.glob("*.en.vtt") if "live_chat" not in f.name]
-            if vtts:
-                job.transcript      = vtt_to_text(vtts[0])
+            if vtt:
+                job.transcript      = vtt_to_text(vtt)
                 job.subtitle_source = "auto"
-                vtts[0].unlink(missing_ok=True)
-                log.info("[%s] Auto subtitles downloaded", job.job_id[:8])
+                vtt.unlink(missing_ok=True)
+                log.info("[%s] Auto subtitles downloaded (%s)",
+                         job.job_id[:8], vtt.name)
             else:
                 job.subtitle_source = "none"
 
@@ -411,7 +461,7 @@ def download_worker(job: Job):
 app = FastAPI(
     title="ytdlp-service",
     description="YouTube metadata, subtitle and audio download microservice",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 

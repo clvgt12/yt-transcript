@@ -1,3 +1,6 @@
 # Local environment — contains API keys, never commit
 .env
+.env.secrets
+.last_signed_version
+.amo-*
 ping-ollama-model.sh

@@ -14,15 +14,43 @@
 #   ./yt-transcribe.sh build [args...]    # build; extra args passed through
 #                                         #   e.g. ./yt-transcribe.sh build --no-cache
 #   ./yt-transcribe.sh clean              # docker system prune -f (see warning below)
+#   ./yt-transcribe.sh package {firefox|chromium|all}
+#                                         # sign/pack the browser extension for
+#                                         # manual install — see below
 #
 # Override auto-detection if needed:
 #   YT_TRANSCRIBE_GPU=cuda  ./yt-transcribe.sh start
 #   YT_TRANSCRIBE_GPU=intel ./yt-transcribe.sh start
+#
+# Extension packaging:
+#   - Source lives in ./extensions/yt-transcribe/ (this repo, git-tracked).
+#   - Signed/packed output and the Chromium signing key live OUTSIDE the repo,
+#     under ~/yt-transcribe/extensions/ (override with YT_TRANSCRIBE_HOME).
+#   - Firefox signing needs AMO_JWT_ISSUER / AMO_JWT_SECRET — put them in a
+#     gitignored .env.secrets file next to this script; the Firefox leg is
+#     skipped (not failed) if they're unset.
+#   - Chromium packing needs a chrome/chromium binary on PATH; no credentials
+#     required. The first run generates and keeps a signing key permanently —
+#     back it up (e.g. to pinet01); losing it breaks future updates.
+#   - No auto-update server is set up (deliberately) — install each signed
+#     build manually via about:addons / chrome://extensions.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_COMPOSE="${SCRIPT_DIR}/docker-compose.yml"
+
+# ─── Extension packaging paths ─────────────────────────────────────────────────
+
+EXT_SRC_DIR="${SCRIPT_DIR}/extensions/yt-transcribe"                 # git-tracked source
+YT_TRANSCRIBE_HOME="${YT_TRANSCRIBE_HOME:-${HOME}/yt-transcribe}"    # deploy dir, not git-tracked
+EXT_DEPLOY_DIR="${YT_TRANSCRIBE_HOME}/extensions"
+EXT_DIST_DIR="${EXT_DEPLOY_DIR}/dist"
+EXT_KEYS_DIR="${EXT_DEPLOY_DIR}/keys"
+CHROMIUM_KEY="${EXT_KEYS_DIR}/yt-transcribe.pem"
+
+# Optional local secrets (AMO API credentials) — gitignored, sourced if present
+[ -f "${SCRIPT_DIR}/.env.secrets" ] && source "${SCRIPT_DIR}/.env.secrets"
 
 # ─── Logging helpers ──────────────────────────────────────────────────────────
 
@@ -84,6 +112,74 @@ run_compose() {
     docker compose "${args[@]}" "$@"
 }
 
+# ─── Extension packaging helpers ───────────────────────────────────────────────
+
+manifest_version() {
+    local manifest="$1"
+    if command -v jq &>/dev/null; then
+        jq -r '.version' "${manifest}"
+    else
+        grep -m1 '"version"' "${manifest}" \
+            | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+    fi
+}
+
+sign_extension() {
+    [ -f "${EXT_SRC_DIR}/manifest.json" ] || die "Extension source not found at ${EXT_SRC_DIR}"
+
+    if [ -z "${AMO_JWT_ISSUER:-}" ] || [ -z "${AMO_JWT_SECRET:-}" ]; then
+        log "AMO_JWT_ISSUER / AMO_JWT_SECRET not set (see .env.secrets) — skipping Firefox signing."
+        return 0
+    fi
+    command -v web-ext &>/dev/null || die "web-ext not found on PATH — install with: npm install --global web-ext"
+
+    local version
+    version="$(manifest_version "${EXT_SRC_DIR}/manifest.json")"
+    log "Signing Firefox extension v${version}..."
+
+    mkdir -p "${EXT_DIST_DIR}"
+    web-ext sign \
+        --source-dir="${EXT_SRC_DIR}" \
+        --channel=unlisted \
+        --api-key="${AMO_JWT_ISSUER}" \
+        --api-secret="${AMO_JWT_SECRET}" \
+        --artifacts-dir="${EXT_DIST_DIR}"
+
+    log "Signed .xpi written to ${EXT_DIST_DIR}/"
+}
+
+pack_chromium_extension() {
+    [ -f "${EXT_SRC_DIR}/manifest.json" ] || die "Extension source not found at ${EXT_SRC_DIR}"
+
+    local chrome_bin
+    chrome_bin="$(command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+    [ -n "${chrome_bin}" ] || die "No Chrome/Chromium binary found on PATH."
+
+    local version
+    version="$(manifest_version "${EXT_SRC_DIR}/manifest.json")"
+
+    mkdir -p "${EXT_DIST_DIR}" "${EXT_KEYS_DIR}"
+    chmod 700 "${EXT_KEYS_DIR}"
+
+    if [ ! -f "${CHROMIUM_KEY}" ]; then
+        log "No existing signing key at ${CHROMIUM_KEY} — generating a NEW one."
+        "${chrome_bin}" --pack-extension="${EXT_SRC_DIR}" --no-sandbox
+        [ -f "${EXT_SRC_DIR}.pem" ] || die "Packing failed — no .pem produced."
+        mv "${EXT_SRC_DIR}.pem" "${CHROMIUM_KEY}"
+        chmod 600 "${CHROMIUM_KEY}"
+        log "!! New key saved to ${CHROMIUM_KEY} — back this up NOW (e.g. to pinet01)."
+        log "!! Losing it means you can never publish a trusted update under this ID again."
+    else
+        log "Packing Chromium extension v${version}..."
+        "${chrome_bin}" --pack-extension="${EXT_SRC_DIR}" --pack-extension-key="${CHROMIUM_KEY}" --no-sandbox
+    fi
+
+    [ -f "${EXT_SRC_DIR}.crx" ] || die "Packing failed — no .crx produced."
+    mv "${EXT_SRC_DIR}.crx" "${EXT_DIST_DIR}/yt-transcribe-${version}.crx"
+    log "Packed: ${EXT_DIST_DIR}/yt-transcribe-${version}.crx"
+    log "Install manually: drag onto chrome://extensions (Developer mode on)."
+}
+
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -126,6 +222,15 @@ cmd_realclean() {
     cmd_clean
 }
 
+cmd_package() {
+    case "${1:-}" in
+        firefox)  sign_extension ;;
+        chromium) pack_chromium_extension ;;
+        all)      sign_extension; pack_chromium_extension ;;
+        *) die "Usage: $(basename "$0") package {firefox|chromium|all}" ;;
+    esac
+}
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 [ -f "${BASE_COMPOSE}" ] || die "docker-compose.yml not found in ${SCRIPT_DIR} — run this script from the repo root"
@@ -137,9 +242,10 @@ case "${1:-}" in
     build)   shift; cmd_build "$@" ;;
     clean)   cmd_clean ;;
     realclean) cmd_realclean ;;
+    package) shift; cmd_package "$@" ;;
     *)
         cat >&2 <<EOF
-Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean}
+Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|chromium|all}}
 
   start              Detect GPU backend and start the stack (up -d)
   stop               Stop the stack (down)
@@ -147,9 +253,14 @@ Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean}
   build [args...]    Build images; extra args passed through (e.g. --no-cache)
   clean              docker system prune -f (host-wide — see warning)
   realclean          stop, then clean
+  package TARGET     Sign/pack the browser extension for manual install:
+                       firefox  — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET)
+                       chromium — self-signed .crx (needs chrome/chromium on PATH)
+                       all      — both
 
 GPU backend is auto-detected (nvidia-smi -> cuda, /dev/dri/renderD128 -> intel).
 Override with: YT_TRANSCRIBE_GPU=cuda|intel
+Extension deploy dir defaults to ~/yt-transcribe/extensions — override with YT_TRANSCRIBE_HOME.
 EOF
         exit 1
         ;;

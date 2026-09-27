@@ -180,6 +180,40 @@ pack_chromium_extension() {
     log "Install manually: drag onto chrome://extensions (Developer mode on)."
 }
 
+# ─── Git tagging ────────────────────────────────────────────────────────────
+
+require_clean_worktree() {
+    git -C "${SCRIPT_DIR}" diff --quiet --ignore-submodules -- . \
+        || die "Uncommitted changes in the working tree — commit or stash before tagging"
+    git -C "${SCRIPT_DIR}" diff --cached --quiet --ignore-submodules -- . \
+        || die "Staged but uncommitted changes — commit before tagging"
+}
+
+tag_release() {
+    local push=false
+    [ "${1:-}" = "--push" ] && push=true
+
+    [ -f "${EXT_SRC_DIR}/manifest.json" ] || die "Extension source not found at ${EXT_SRC_DIR}"
+    require_clean_worktree
+
+    local version tag
+    version="$(manifest_version "${EXT_SRC_DIR}/manifest.json")"
+    tag="v${version}"
+
+    git -C "${SCRIPT_DIR}" rev-parse -q --verify "refs/tags/${tag}" &>/dev/null \
+        && die "Tag ${tag} already exists — bump the version in manifest.json first"
+
+    log "Tagging ${tag} at $(git -C "${SCRIPT_DIR}" rev-parse --short HEAD)"
+    git -C "${SCRIPT_DIR}" tag -a "${tag}" -m "yt-transcribe ${tag}"
+
+    if [ "${push}" = true ]; then
+        log "Pushing tag ${tag} to origin..."
+        git -C "${SCRIPT_DIR}" push origin "${tag}"
+    else
+        log "Tag created locally — push with: git push origin ${tag}"
+    fi
+}
+
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -231,6 +265,15 @@ cmd_package() {
     esac
 }
 
+cmd_tag() {
+    tag_release "$@"
+}
+
+cmd_release() {
+    cmd_package all
+    tag_release "$@"
+}
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 [ -f "${BASE_COMPOSE}" ] || die "docker-compose.yml not found in ${SCRIPT_DIR} — run this script from the repo root"
@@ -243,6 +286,8 @@ case "${1:-}" in
     clean)   cmd_clean ;;
     realclean) cmd_realclean ;;
     package) shift; cmd_package "$@" ;;
+    tag)     shift; cmd_tag "$@" ;;
+    release) shift; cmd_release "$@" ;;
     *)
         cat >&2 <<EOF
 Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|chromium|all}}
@@ -257,6 +302,8 @@ Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|pack
                        firefox  — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET)
                        chromium — self-signed .crx (needs chrome/chromium on PATH)
                        all      — both
+  tag [--push]       Tag HEAD as v<manifest version> (fails on dirty tree or duplicate tag)
+  release [--push]   package all, then tag (fails closed if either step fails)
 
 GPU backend is auto-detected (nvidia-smi -> cuda, /dev/dri/renderD128 -> intel).
 Override with: YT_TRANSCRIBE_GPU=cuda|intel

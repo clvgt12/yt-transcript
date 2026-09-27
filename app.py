@@ -112,6 +112,8 @@ OLLAMA_TOOLS = [
     }
 ]
 
+# ─── Web browser extension support ───────────────────────────────────────
+YT_WATCH_RE = re.compile(r"^https://www\.youtube\.com/watch\?v=[\w-]{11}$")
 
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     """
@@ -1242,12 +1244,36 @@ def main():
         st.session_state.job = None
     if "cancel_requested" not in st.session_state:
         st.session_state.cancel_requested = False
-
-    # ── INPUT DIV ─────────────────────────────────────────────────────────────
-    st.markdown("#### Input")
     # Counter-based key forces widget re-instantiation on clear, resetting its value
     if "input_counter" not in st.session_state:
         st.session_state.input_counter = 0
+
+    # ── run_pipeline() helper function ────────────────────────────────────────
+    def run_pipeline(url):
+        if "youtube.com" not in url and "youtu.be" not in url:
+            st.error("Please enter a valid YouTube URL.")
+        else:
+            job = Job(str(uuid.uuid4()), url)
+            st.session_state.job = job          # store object, not just id
+            t = threading.Thread(
+                target=run_workflow, args=(job,),
+                daemon=True, name=f"worker-{job.job_id[:8]}"
+            )
+            t.start()
+            log.info("Job started: %s — %s", job.job_id, url)
+            st.rerun()
+
+    # ── Browser extension support: ?url=<canonical watch URL> ─────────────────
+    incoming = st.query_params.get("url")
+    if (incoming and YT_WATCH_RE.fullmatch(incoming)
+            and not st.session_state.get("autostarted")):
+        st.session_state["autostarted"] = True
+        st.session_state[f"yt_url_input_{st.session_state.input_counter}"] = incoming
+        st.query_params.clear()   # a browser refresh won't resubmit
+        run_pipeline(incoming)
+
+    # ── INPUT DIV ─────────────────────────────────────────────────────────────
+    st.markdown("#### Input")
 
     with st.form("transcribe_form", clear_on_submit=False):
         yt_url = st.text_input(
@@ -1269,19 +1295,7 @@ def main():
 
     # Handle submission — create Job, store in session_state, start thread
     if submitted and yt_url.strip():
-        url = yt_url.strip()
-        if "youtube.com" not in url and "youtu.be" not in url:
-            st.error("Please enter a valid YouTube URL.")
-        else:
-            job = Job(str(uuid.uuid4()), url)
-            st.session_state.job = job          # store object, not just id
-            t = threading.Thread(
-                target=run_workflow, args=(job,),
-                daemon=True, name=f"worker-{job.job_id[:8]}"
-            )
-            t.start()
-            log.info("Job started: %s — %s", job.job_id, url)
-            st.rerun()
+        run_pipeline(yt_url.strip())
 
     # ── OUTPUT DIV ────────────────────────────────────────────────────────────
     st.markdown("""

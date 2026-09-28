@@ -36,6 +36,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("yt-transcribe-web")
 
+# ─── Load environment files ──────────────────────────────────────────────────
+
+from dotenv import load_dotenv
+
+# Load secrets first, then defaults (secrets take precedence)
+load_dotenv('.env.secrets')  # Contains OLLAMA_API_KEY and Mozilla API credentials
+load_dotenv('.env')          # Contains non-secret defaults
+
 # ─── Configuration from environment ──────────────────────────────────────────
 
 FILES_BASE            = Path(os.environ.get("FILES_BASE",           "/usr/app/files"))

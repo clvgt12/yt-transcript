@@ -44,16 +44,23 @@ cd yt-transcript
 
 ### 2. Configure environment variables
 
+Create two files:
+
+**Step 2a: Non-secret defaults (`.env`)**
 ```bash
 cp env.example .env
 ```
 
-Edit `.env` and set, at minimum:
-
-```
+**Step 2b: Secret credentials (`.env.secrets`)**
+Create `.env.secrets` with your sensitive API keys:
+```bash
+cat > .env.secrets << 'EOF'
 OLLAMA_API_KEY=your-key-from-ollama.com
+EOF
+chmod 600 .env.secrets
 ```
 
+Both files are git-ignored; never commit them.
 See [Configuration](#configuration) below for every available option.
 
 ### 3. Intel GPU hosts only — set your render group GID
@@ -128,7 +135,7 @@ All settings live in `.env` (see `env.example` for the full annotated template).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_API_KEY` | *(required)* | Cloud model access — [get one here](https://ollama.com/settings/keys) |
+| `OLLAMA_API_KEY` | *(required)* | Cloud model access — **stored in `.env.secrets`** — [get one here](https://ollama.com/settings/keys) |
 | `OLLAMA_PRIMARY_MODEL` | `gpt-oss:120b-cloud` | Summarization model, tried first |
 | `OLLAMA_FALLBACK_MODEL` | `qwen3:1.7b` | Local model, used if the primary fails or cloud is disabled |
 | `OLLAMA_NO_CLOUD` | `0` | Set `1` to force fully local summarization, no cloud calls at all |

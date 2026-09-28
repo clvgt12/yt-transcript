@@ -71,8 +71,9 @@ EXT_DIST_DIR="${EXT_DEPLOY_DIR}/dist"
 EXT_KEYS_DIR="${EXT_DEPLOY_DIR}/keys"
 CHROMIUM_KEY="${EXT_KEYS_DIR}/yt-transcribe.pem"
 
-# Optional local secrets (AMO API credentials) — gitignored, sourced if present
+# Load environment files: secrets first (highest priority), then defaults
 [ -f "${SCRIPT_DIR}/.env.secrets" ] && source "${SCRIPT_DIR}/.env.secrets"
+[ -f "${SCRIPT_DIR}/.env" ] && source "${SCRIPT_DIR}/.env"
 
 # ─── Logging helpers ──────────────────────────────────────────────────────────
 

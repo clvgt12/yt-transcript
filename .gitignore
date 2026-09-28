@@ -1,6 +1,22 @@
-# Local environment — contains API keys, never commit
+# Local environment variable files
 .env
 .env.secrets
+.env.local
+
+# Web browser extension ephemeral and security sensitive files
 .last_signed_version
 .amo-*
+
+# Docker
+.docker/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# NodeJS
+node_modules/
+
+# Miscellaneous files
 ping-ollama-model.sh

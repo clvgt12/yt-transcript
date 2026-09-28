@@ -14,7 +14,7 @@
 #   ./yt-transcribe.sh build [args...]    # build; extra args passed through
 #                                         #   e.g. ./yt-transcribe.sh build --no-cache
 #   ./yt-transcribe.sh clean              # docker system prune -f (see warning below)
-#   ./yt-transcribe.sh package {firefox|chromium|all}
+#   ./yt-transcribe.sh package {firefox|firefox-dev|chromium|all|dev}
 #                                         # sign/pack the browser extension for
 #                                         # manual install — see below
 #   ./yt-transcribe.sh tag [--no-push]    # tag HEAD as v<manifest version>
@@ -38,6 +38,11 @@
 #     back it up (e.g. to pinet01); losing it breaks future updates.
 #   - No auto-update server is set up (deliberately) — install each signed
 #     build manually via about:addons / chrome://extensions.
+#   - AMO signing is keyed on (extension ID, version) GLOBALLY — once one host
+#     signs a version, no other host can ever sign that same version (you'll
+#     get a "Conflict: Version already exists" error, not a bug). Only one
+#     host should own signing+tagging a given release; a second host should
+#     use `package firefox-dev` (or `package dev`) for local testing instead.
 #
 # Release tagging:
 #   - `tag` reads the version straight from extensions/yt-transcribe/manifest.json
@@ -163,6 +168,25 @@ sign_extension() {
         --artifacts-dir="${EXT_DIST_DIR}"
 
     log "Signed .xpi written to ${EXT_DIST_DIR}/"
+}
+
+build_extension_unsigned() {
+    [ -f "${EXT_SRC_DIR}/manifest.json" ] || die "Extension source not found at ${EXT_SRC_DIR}"
+    command -v web-ext &>/dev/null || die "web-ext not found on PATH — install with: npm install --global web-ext"
+
+    local version
+    version="$(manifest_version "${EXT_SRC_DIR}/manifest.json")"
+    log "Building UNSIGNED Firefox extension v${version} (no AMO submission — local testing only)..."
+
+    mkdir -p "${EXT_DIST_DIR}"
+    web-ext build \
+        --source-dir="${EXT_SRC_DIR}" \
+        --artifacts-dir="${EXT_DIST_DIR}" \
+        --overwrite-dest
+
+    log "Unsigned .zip written to ${EXT_DIST_DIR}/"
+    log "Load it via about:debugging#/runtime/this-firefox -> Load Temporary Add-on"
+    log "(unpacked/unsigned — cleared on Firefox restart, fine for local testing)."
 }
 
 pack_chromium_extension() {
@@ -313,10 +337,12 @@ cmd_realclean() {
 
 cmd_package() {
     case "${1:-}" in
-        firefox)  sign_extension ;;
-        chromium) pack_chromium_extension ;;
-        all)      sign_extension; pack_chromium_extension ;;
-        *) die "Usage: $(basename "$0") package {firefox|chromium|all}" ;;
+        firefox)     sign_extension ;;
+        firefox-dev) build_extension_unsigned ;;
+        chromium)    pack_chromium_extension ;;
+        all)         sign_extension; pack_chromium_extension ;;
+        dev)         build_extension_unsigned; pack_chromium_extension ;;
+        *) die "Usage: $(basename "$0") package {firefox|firefox-dev|chromium|all|dev}" ;;
     esac
 }
 
@@ -346,7 +372,7 @@ case "${1:-}" in
     sync-tags) cmd_sync_tags ;;
     *)
         cat >&2 <<EOF
-Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|chromium|all}|tag [--no-push]|release [--no-push]|sync-tags}
+Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|firefox-dev|chromium|all|dev}|tag [--no-push]|release [--no-push]|sync-tags}
 
   start               Detect GPU backend and start the stack (up -d)
   stop                Stop the stack (down)
@@ -355,9 +381,20 @@ Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|pack
   clean               docker system prune -f (host-wide — see warning)
   realclean           stop, then clean
   package TARGET      Sign/pack the browser extension for manual install:
-                        firefox  — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET)
-                        chromium — self-signed .crx (needs chrome/chromium on PATH)
-                        all      — both
+                        firefox     — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET;
+                                       fails with a Conflict if this version was
+                                       already signed on another host — use
+                                       firefox-dev there instead, or bump the
+                                       version in manifest.json to re-release)
+                        firefox-dev — UNSIGNED .zip, no AMO submission, for local
+                                       testing via about:debugging (temporary add-on)
+                        chromium    — self-signed .crx (needs chrome/chromium on
+                                       PATH; no AMO involved, safe to re-run on
+                                       any host)
+                        all         — firefox (signed) + chromium
+                        dev         — firefox-dev (unsigned) + chromium; use this
+                                       on a second host once another host already
+                                       owns the signed release for this version
   tag [--no-push]     Tag HEAD as v<manifest version> and push to origin
                         (fails on dirty tree or duplicate tag)
   release [--no-push] package all, then tag

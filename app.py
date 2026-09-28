@@ -217,6 +217,13 @@ def web_search(query: str, max_results: int = 5) -> list:
                 url = r.get("href", "") or r.get("url", "")
                 if not url:
                     continue
+
+                # Validate URL reachability
+                attempts += 1
+                if not _url_reachable(url):
+                    log.debug("Web search: skipping unreachable URL — %s", url)
+                    continue
+
                 validated.append({
                     "title": r.get("title", ""),
                     "url":   url,

@@ -17,6 +17,10 @@
 #   ./yt-transcribe.sh package {firefox|chromium|all}
 #                                         # sign/pack the browser extension for
 #                                         # manual install — see below
+#   ./yt-transcribe.sh tag [--no-push]    # tag HEAD as v<manifest version>
+#   ./yt-transcribe.sh release [--no-push]
+#                                         # package all, then tag
+#   ./yt-transcribe.sh sync-tags          # fetch tags, report ahead/behind/diverged
 #
 # Override auto-detection if needed:
 #   YT_TRANSCRIBE_GPU=cuda  ./yt-transcribe.sh start
@@ -34,6 +38,19 @@
 #     back it up (e.g. to pinet01); losing it breaks future updates.
 #   - No auto-update server is set up (deliberately) — install each signed
 #     build manually via about:addons / chrome://extensions.
+#
+# Release tagging:
+#   - `tag` reads the version straight from extensions/yt-transcribe/manifest.json
+#     (the same source `package` reads), so the git tag can never disagree with
+#     what's inside the .xpi/.crx you built.
+#   - Refuses to tag a dirty working tree, and refuses to re-tag an existing
+#     version — bump manifest.json first.
+#   - Pushes to origin by default (pass --no-push to just tag locally).
+#   - `release` is `package all` + `tag` chained, so a partial/failed package
+#     never gets tagged.
+#   - `sync-tags` is manual/opt-in (not run automatically by `start`) — fetches
+#     tags from origin and tells you if this host (kamakazi/tepache) is behind,
+#     ahead of, or diverged from the newest tag.
 
 set -euo pipefail
 
@@ -190,8 +207,8 @@ require_clean_worktree() {
 }
 
 tag_release() {
-    local push=false
-    [ "${1:-}" = "--push" ] && push=true
+    local push=true
+    [ "${1:-}" = "--no-push" ] && push=false
 
     [ -f "${EXT_SRC_DIR}/manifest.json" ] || die "Extension source not found at ${EXT_SRC_DIR}"
     require_clean_worktree
@@ -209,8 +226,46 @@ tag_release() {
     if [ "${push}" = true ]; then
         log "Pushing tag ${tag} to origin..."
         git -C "${SCRIPT_DIR}" push origin "${tag}"
+        log "Remember to 'git fetch --tags' on the other host (kamakazi/tepache) to stay in sync."
     else
         log "Tag created locally — push with: git push origin ${tag}"
+    fi
+}
+
+# ─── Tag sync/status (manual, opt-in — not run automatically by start/build) ──
+
+cmd_sync_tags() {
+    git -C "${SCRIPT_DIR}" rev-parse --is-inside-work-tree &>/dev/null \
+        || die "${SCRIPT_DIR} is not a git repository"
+
+    log "Fetching tags from origin..."
+    git -C "${SCRIPT_DIR}" fetch --tags --prune-tags --quiet
+
+    local latest_tag
+    latest_tag="$(git -C "${SCRIPT_DIR}" tag --list 'v*' --sort=-v:refname | head -n1)"
+
+    if [ -z "${latest_tag}" ]; then
+        log "No v* tags found — nothing to compare."
+        return 0
+    fi
+
+    local head_commit tag_commit
+    head_commit="$(git -C "${SCRIPT_DIR}" rev-parse HEAD)"
+    tag_commit="$(git -C "${SCRIPT_DIR}" rev-parse "${latest_tag}^{commit}")"
+
+    log "Newest tag:  ${latest_tag} ($(git -C "${SCRIPT_DIR}" rev-parse --short "${latest_tag}"))"
+    log "Checked out: $(git -C "${SCRIPT_DIR}" rev-parse --short HEAD) on $(git -C "${SCRIPT_DIR}" rev-parse --abbrev-ref HEAD)"
+
+    if [ "${head_commit}" = "${tag_commit}" ]; then
+        log "Up to date — HEAD is exactly at ${latest_tag}."
+    elif git -C "${SCRIPT_DIR}" merge-base --is-ancestor "${tag_commit}" "${head_commit}"; then
+        log "Ahead of ${latest_tag} (untagged commits on top) — normal mid-development."
+    elif git -C "${SCRIPT_DIR}" merge-base --is-ancestor "${head_commit}" "${tag_commit}"; then
+        log "!! BEHIND ${latest_tag} — this host is missing the tagged release."
+        log "!! Run: git -C ${SCRIPT_DIR} pull   (or: git checkout ${latest_tag})"
+    else
+        log "!! DIVERGED from ${latest_tag} — local commits exist that aren't on the tag's line."
+        log "!! Investigate manually: git -C ${SCRIPT_DIR} log --oneline --graph HEAD ${latest_tag}"
     fi
 }
 
@@ -279,31 +334,36 @@ cmd_release() {
 [ -f "${BASE_COMPOSE}" ] || die "docker-compose.yml not found in ${SCRIPT_DIR} — run this script from the repo root"
 
 case "${1:-}" in
-    start)   cmd_start ;;
-    stop)    cmd_stop ;;
-    restart) cmd_restart ;;
-    build)   shift; cmd_build "$@" ;;
-    clean)   cmd_clean ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_restart ;;
+    build)     shift; cmd_build "$@" ;;
+    clean)     cmd_clean ;;
     realclean) cmd_realclean ;;
-    package) shift; cmd_package "$@" ;;
-    tag)     shift; cmd_tag "$@" ;;
-    release) shift; cmd_release "$@" ;;
+    package)   shift; cmd_package "$@" ;;
+    tag)       shift; cmd_tag "$@" ;;
+    release)   shift; cmd_release "$@" ;;
+    sync-tags) cmd_sync_tags ;;
     *)
         cat >&2 <<EOF
-Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|chromium|all}}
+Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|package {firefox|chromium|all}|tag [--no-push]|release [--no-push]|sync-tags}
 
-  start              Detect GPU backend and start the stack (up -d)
-  stop               Stop the stack (down)
-  restart            stop, then start
-  build [args...]    Build images; extra args passed through (e.g. --no-cache)
-  clean              docker system prune -f (host-wide — see warning)
-  realclean          stop, then clean
-  package TARGET     Sign/pack the browser extension for manual install:
-                       firefox  — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET)
-                       chromium — self-signed .crx (needs chrome/chromium on PATH)
-                       all      — both
-  tag [--push]       Tag HEAD as v<manifest version> (fails on dirty tree or duplicate tag)
-  release [--push]   package all, then tag (fails closed if either step fails)
+  start               Detect GPU backend and start the stack (up -d)
+  stop                Stop the stack (down)
+  restart             stop, then start
+  build [args...]     Build images; extra args passed through (e.g. --no-cache)
+  clean               docker system prune -f (host-wide — see warning)
+  realclean           stop, then clean
+  package TARGET      Sign/pack the browser extension for manual install:
+                        firefox  — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET)
+                        chromium — self-signed .crx (needs chrome/chromium on PATH)
+                        all      — both
+  tag [--no-push]     Tag HEAD as v<manifest version> and push to origin
+                        (fails on dirty tree or duplicate tag)
+  release [--no-push] package all, then tag
+  sync-tags           Fetch tags from origin and report if this host is
+                        behind, ahead of, or diverged from the newest v* tag
+                        (manual/opt-in — never run automatically)
 
 GPU backend is auto-detected (nvidia-smi -> cuda, /dev/dri/renderD128 -> intel).
 Override with: YT_TRANSCRIBE_GPU=cuda|intel

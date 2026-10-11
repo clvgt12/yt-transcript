@@ -78,6 +78,16 @@ FILES_BASE.mkdir(parents=True, exist_ok=True)
 BGUTIL_BASE_URL = os.environ.get("BGUTIL_BASE_URL", "http://bgutil-provider:4416")
 POT_ARGS = ["--extractor-args", f"youtubepot-bgutilhttp:base_url={BGUTIL_BASE_URL}"]
 
+# ─── Extraction cache: one YouTube extraction per video ──────────────────────
+INFO_DIR         = Path(os.environ.get("INFO_DIR", "/tmp/ytdlp-info"))
+INFO_TTL_SECONDS = int(os.environ.get("INFO_TTL_SECONDS", "600"))   # 10 min
+VIDEO_ID_RE      = re.compile(r"[A-Za-z0-9_-]{11}")
+INFO_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    os.chmod(INFO_DIR, 0o700)   # info.json holds signed, IP-bound stream URLs
+except OSError:
+    pass
+
 # ─── Per-job watchdog ─────────────────────────────────────────────────────────
 
 class JobWatchdog:
@@ -308,43 +318,116 @@ def _run_cmd(job: Job, cmd: list) -> tuple[int, str, str]:
     job.process = None
     return rc, stdout.strip(), stderr.strip()
 
+def _info_path(video_id: str) -> Path:
+    return INFO_DIR / f"{video_id}.info.json"
 
-def _fetch_subs(job: Job, out_dir: Path, *, auto: bool) -> Optional[Path]:
+
+def _read_cached_info(video_id: str) -> Optional[dict]:
+    """Saved extraction if fresh and parseable, else None."""
+    p = _info_path(video_id)
+    try:
+        if time.time() - p.stat().st_mtime > INFO_TTL_SECONDS:
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _purge_old_info(max_age: int = 3600):
+    cutoff = time.time() - max_age
+    for f in INFO_DIR.glob("*.info.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _extract_info(job: Job) -> Optional[dict]:
     """
-    Download English subtitles for job.video_id and return the .vtt path,
-    or None if unavailable. Never raises for a missing/blocked track — it
-    logs WHY (HTTP 429, other yt-dlp error, or simply not available) so the
-    caller can fall back to Whisper. Returns None if the job was cancelled;
-    callers must check job.status.
+    The only step that asks YouTube about a video (watch page + player API).
+    Returns None if the job was cancelled; raises RuntimeError on failure.
     """
     video_id = job.video_id
-    langs    = AUTO_SUB_LANGS if auto else HUMAN_SUB_LANGS
-    kind     = "auto" if auto else "human"
+    info = _read_cached_info(video_id)
+    if info is not None:
+        log.info("[%s] Reusing saved extraction for %s", job.job_id[:8], video_id)
+        return info
 
-    # Clear leftovers so a stale file can't masquerade as a fresh download
-    for stale in out_dir.glob(f"{video_id}.*.vtt"):
-        stale.unlink(missing_ok=True)
-
-    cmd = [YT_DLP_BIN, "--skip-download",
-           "--write-auto-subs" if auto else "--write-subs",
-           "--sub-langs", ",".join(langs), "--sub-format", "vtt",
-           # ID-based filename: immune to title sanitization (e.g. '：')
-           "--output", str(out_dir / "%(id)s.%(ext)s")]
-    if not auto:
-        cmd += ["--extractor-args", "youtube:skip=translated_subs"]
-    cmd += ["--", f"https://www.youtube.com/watch?v={video_id}"]
-
-    rc, _, stderr = _run_cmd(job, cmd)
+    _purge_old_info()
+    log.info("[%s] Extracting %s from YouTube", job.job_id[:8], video_id)
+    p = _info_path(video_id)
+    p.unlink(missing_ok=True)
+    rc, _, stderr = _run_cmd(job, [
+        YT_DLP_BIN, "--skip-download", "--no-playlist", "--write-info-json",
+        "--output", f"infojson:{INFO_DIR}/%(id)s",
+        "--", f"https://www.youtube.com/watch?v={video_id}",
+    ])
     if job.status == "failed":
         return None
 
-    # First match in preference order
-    for lang in langs:
-        p = out_dir / f"{video_id}.{lang}.vtt"
-        if p.exists() and p.stat().st_size > 0:
-            return p
+    js_warning = "no supported javascript runtime" in stderr.lower()
+    if js_warning:
+        log.warning("[%s] yt-dlp JS runtime warning: %s", job.job_id[:8], stderr[:120])
+    if rc == 0:
+        try:
+            info = json.loads(p.read_text(encoding="utf-8"))
+            os.chmod(p, 0o600)
+            return info
+        except (OSError, ValueError):
+            pass
+    if js_warning:
+        raise RuntimeError(
+            "YouTube requires a JavaScript runtime for this video. "
+            "Deno is being installed — please retry after container rebuild."
+        )
+    raise RuntimeError(f"Metadata fetch failed: {_yt_error(stderr)}")
 
-    # No file — say why instead of failing silently
+
+def _pick_sub_lang(info: dict, *, auto: bool) -> Optional[str]:
+    """First wanted language with a real (non-translated) track, else None."""
+    tracks = (info.get("automatic_captions") if auto else info.get("subtitles")) or {}
+    for lang in (AUTO_SUB_LANGS if auto else HUMAN_SUB_LANGS):
+        entries = tracks.get(lang) or []
+        # tlang= marks a machine translation, the case behind the 429s (#13831)
+        if entries and not any("tlang=" in (e.get("url") or "") for e in entries):
+            return lang
+    return None
+
+def _fetch_subs(job: Job, out_dir: Path, info: dict, info_path: Path,
+                *, auto: bool) -> Optional[Path]:
+    """
+    Download one English subtitle track from the saved extraction; return the
+    .vtt path or None. Makes no request when no suitable track exists. Never
+    raises for a missing/blocked track -- it logs why so the caller can fall
+    back to Whisper. Returns None if cancelled; callers must check job.status.
+    """
+    video_id = job.video_id
+    kind     = "auto" if auto else "human"
+    wanted   = AUTO_SUB_LANGS if auto else HUMAN_SUB_LANGS
+
+    lang = _pick_sub_lang(info, auto=auto)
+    if lang is None:
+        log.info("[%s] No %s subtitles available (%s)",
+                 job.job_id[:8], kind, ",".join(wanted))
+        return None
+
+    for stale in out_dir.glob(f"{video_id}.*.vtt"):
+        stale.unlink(missing_ok=True)
+
+    rc, _, stderr = _run_cmd(job, [
+        YT_DLP_BIN, "--load-info-json", str(info_path), "--skip-download",
+        "--write-auto-subs" if auto else "--write-subs",
+        "--sub-langs", lang, "--sub-format", "vtt",
+        "--output", str(out_dir / "%(id)s.%(ext)s"),
+    ])
+    if job.status == "failed":
+        return None
+
+    p = out_dir / f"{video_id}.{lang}.vtt"
+    if p.exists() and p.stat().st_size > 0:
+        return p
+
     if "429" in stderr:
         log.warning("[%s] %s subtitles rate-limited by YouTube (HTTP 429)",
                     job.job_id[:8], kind)
@@ -353,8 +436,7 @@ def _fetch_subs(job: Job, out_dir: Path, *, auto: bool) -> Optional[Path]:
         log.warning("[%s] %s subtitle fetch failed rc=%s: %s",
                     job.job_id[:8], kind, rc, tail[:300])
     else:
-        log.info("[%s] No %s subtitles available (%s)",
-                 job.job_id[:8], kind, ",".join(langs))
+        log.info("[%s] %s subtitles not written (%s)", job.job_id[:8], kind, lang)
     return None
 
 def _yt_error(stderr: str, limit: int = 400) -> str:
@@ -377,41 +459,22 @@ def download_worker(job: Job):
              job.job_id[:8], job.meta, job.human, job.auto, job.audio)
 
     try:
-        # ── 1. Metadata ───────────────────────────────────────────────────────
+        # ── 0. One extraction, shared by every step below ─────────────────────
+        info = _extract_info(job)
+        if job.status == "failed":
+            return
+        info_path = _info_path(video_id)
+
+        # ── 1. Metadata (read from the saved extraction, no network) ──────────
         if job.meta:
-            # Fetch title and channel in one yt-dlp call
-            rc, stdout, stderr = _run_cmd(job, [
-                YT_DLP_BIN, "--print", "%(title)s	%(channel|uploader|NA)s", "--",
-                f"https://www.youtube.com/watch?v={video_id}"
-            ])
-            if job.status == "failed":
-                return
-            # Treat JS runtime warning as non-fatal — yt-dlp still extracts
-            # metadata for most videos without a JS runtime
-            js_warning = "no supported javascript runtime" in stderr.lower()
-            if js_warning:
-                log.warning("[%s] yt-dlp JS runtime warning (non-fatal): %s",
-                            job.job_id[:8], stderr[:120])
-            if rc == 0 and stdout:
-                parts        = stdout.split("	", 1)
-                job.title    = parts[0].strip()
-                job.channel  = parts[1].strip() if len(parts) > 1 else None
-                if job.channel in ("NA", ""):
-                    job.channel = None
-                log.info("[%s] Title: %s | Channel: %s",
-                         job.job_id[:8], job.title, job.channel)
-            elif js_warning and not stdout:
-                # JS runtime is blocking extraction entirely for this video
-                raise RuntimeError(
-                    "YouTube requires a JavaScript runtime for this video. "
-                    "Deno is being installed — please retry after container rebuild."
-                )
-            else:
-                raise RuntimeError(f"Metadata fetch failed: {_yt_error(stderr)}")
+            job.title   = (info.get("title") or video_id).strip()
+            job.channel = (info.get("channel") or info.get("uploader") or "").strip() or None
+            log.info("[%s] Title: %s | Channel: %s",
+                     job.job_id[:8], job.title, job.channel)
 
         # ── 2. Human subtitles ────────────────────────────────────────────────
         if job.human:
-            vtt = _fetch_subs(job, out_dir, auto=False)
+            vtt = _fetch_subs(job, out_dir, info, info_path, auto=False)
             if job.status == "failed":
                 return
             if vtt:
@@ -423,7 +486,7 @@ def download_worker(job: Job):
 
         # ── 3. Auto-generated subtitles (native ASR track only) ───────────────
         if job.auto and not job.transcript:
-            vtt = _fetch_subs(job, out_dir, auto=True)
+            vtt = _fetch_subs(job, out_dir, info, info_path, auto=True)
             if job.status == "failed":
                 return
             if vtt:
@@ -435,14 +498,13 @@ def download_worker(job: Job):
             else:
                 job.subtitle_source = "none"
 
-        # ── 4. Audio (mp3) ────────────────────────────────────────────────────
+        # ── 4. Audio (mp3), from the saved extraction ─────────────────────────
         if job.audio:
             log.info("[%s] Downloading audio...", job.job_id[:8])
             rc, _, stderr = _run_cmd(job, [
-                YT_DLP_BIN, "--extract-audio", "--audio-format", "mp3",
-                "--audio-quality", "0",
+                YT_DLP_BIN, "--load-info-json", str(info_path),
+                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
                 "--output", str(out_dir / "%(title)s.%(ext)s"),
-                f"https://www.youtube.com/watch?v={video_id}"
             ])
             if job.status == "failed":
                 return
@@ -532,8 +594,8 @@ def start_download(req: DownloadRequest):
     Start a download job for the given video_id.
     Deduplicates: if an active job exists for this video_id, returns it.
     """
-    if not req.video_id:
-        raise HTTPException(status_code=400, detail="video_id is required")
+    if not VIDEO_ID_RE.fullmatch(req.video_id or ""):
+        raise HTTPException(status_code=400, detail="video_id must be an 11-character YouTube ID")
 
     # ── Deduplication check ───────────────────────────────────────────────────
     existing = get_active_job_for_video(req.video_id)

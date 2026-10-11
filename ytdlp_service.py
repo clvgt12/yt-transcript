@@ -72,6 +72,12 @@ AUTO_SUB_LANGS  = ["en-orig"]
 
 FILES_BASE.mkdir(parents=True, exist_ok=True)
 
+# Mitigate HTTP 429 errors and YouTube bot detection
+#   Implement bgutil-provider sidecar within ytdlp container
+
+BGUTIL_BASE_URL = os.environ.get("BGUTIL_BASE_URL", "http://bgutil-provider:4416")
+POT_ARGS = ["--extractor-args", f"youtubepot-bgutilhttp:base_url={BGUTIL_BASE_URL}"]
+
 # ─── Per-job watchdog ─────────────────────────────────────────────────────────
 
 class JobWatchdog:
@@ -291,6 +297,9 @@ def vtt_to_text(vtt_path: Path) -> str:
 
 def _run_cmd(job: Job, cmd: list) -> tuple[int, str, str]:
     """Run a subprocess, store handle on job for cancellation, return rc/stdout/stderr."""
+    # Inject the PO Token provider URL into every yt-dlp invocation.
+    if cmd and cmd[0] == YT_DLP_BIN:
+        cmd = [cmd[0], *POT_ARGS, *cmd[1:]]
     job.process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
@@ -348,6 +357,14 @@ def _fetch_subs(job: Job, out_dir: Path, *, auto: bool) -> Optional[Path]:
                  job.job_id[:8], kind, ",".join(langs))
     return None
 
+def _yt_error(stderr: str, limit: int = 400) -> str:
+    """Prefer yt-dlp's ERROR lines; warnings alone hide the real cause."""
+    lines = stderr.splitlines()
+    errs = [l for l in lines if l.startswith("ERROR")]
+    text = " | ".join(errs) if errs else " | ".join(lines[-3:])
+    if "not a bot" in text:
+        text = "YouTube bot check (PO token or cookies needed): " + text
+    return text[:limit]
 
 def download_worker(job: Job):
     """Execute requested download operations sequentially."""
@@ -390,7 +407,7 @@ def download_worker(job: Job):
                     "Deno is being installed — please retry after container rebuild."
                 )
             else:
-                raise RuntimeError(f"Metadata fetch failed: {stderr[:200]}")
+                raise RuntimeError(f"Metadata fetch failed: {_yt_error(stderr)}")
 
         # ── 2. Human subtitles ────────────────────────────────────────────────
         if job.human:
@@ -430,7 +447,7 @@ def download_worker(job: Job):
             if job.status == "failed":
                 return
             if rc != 0:
-                raise RuntimeError(f"Audio download failed: {stderr[:200]}")
+                raise RuntimeError(f"Audio download failed: {_yt_error(stderr)}")
             mp3s = list(out_dir.glob("*.mp3"))
             if not mp3s:
                 raise RuntimeError("Audio download produced no mp3")

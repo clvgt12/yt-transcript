@@ -3,4 +3,5 @@
 
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
+bgutil-ytdlp-pot-provider==2.0.2

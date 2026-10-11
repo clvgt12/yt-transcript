@@ -41,13 +41,26 @@ services:
       FILES_BASE:          /files
       JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
       POLL_INTERVAL_MS:    ${POLL_INTERVAL_MS:-2000}
+      BGUTIL_BASE_URL:     http://bgutil-provider:4416
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
       interval: 15s
       timeout: 5s
       retries: 4
       start_period: 20s
+    depends_on: [bgutil-provider]
 
+  # Add the bgutil-provider sidecar to mitigate bot detection and HTTP 429 errors
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:2.0.2   # pin to a specific version
+    init: true
+    restart: unless-stopped
+    networks:
+      - yt-transcribe-net
+    expose:
+      - "4416"
+    # Deliberately NO "ports:" mapping
+    
   # ── Streamlit web application ───────────────────────────────────────────────
   web:
     build:

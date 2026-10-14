@@ -54,6 +54,7 @@ services:
   bgutil-provider:
     image: brainicism/bgutil-ytdlp-pot-provider:2.0.2   # pin to a specific version
     init: true
+    container_name: yt-transcribe-bgutil-provider
     restart: unless-stopped
     networks:
       - yt-transcribe-net

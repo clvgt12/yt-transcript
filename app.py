@@ -462,6 +462,24 @@ def find_cached_job(video_id: str) -> dict:
 
     return result
 
+def load_meta(video_id: str) -> Optional[dict]:
+    """Title/channel saved by a previous run, or None."""
+    path = FILES_BASE / video_id / "meta.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("title"):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+def save_meta(video_id: str, title: str, channel: Optional[str]):
+    out_dir = FILES_BASE / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "meta.json").write_text(
+        json.dumps({"title": title, "channel": channel}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 def save_chat_history(video_id: str, history: list):
     """Persist chat history to <video_id>/chat_history.json."""
@@ -927,30 +945,38 @@ def run_workflow(job: Job):
         if not video_id:
             raise RuntimeError("Could not extract video ID from URL.")
 
-        # ── Fetch metadata via ytdlp-service ──────────────────────────────────
-        resp = requests.post(
-            f"{YTDLP_SERVICE_URL}/download",
-            json={"video_id": video_id, "meta": True},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        meta_job_id = resp.json()["job_id"]
-        job.ytdlp_job_id = meta_job_id
+        # ── Metadata: reuse the saved copy, otherwise ask ytdlp-service once ──
+        saved = load_meta(video_id)
+        if saved:
+            job.log("Metadata cached — skipping YouTube lookup.")
+            video_title   = saved["title"]
+            video_channel = saved.get("channel")
+        else:
+            resp = requests.post(
+                f"{YTDLP_SERVICE_URL}/download",
+                json={"video_id": video_id, "meta": True},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            meta_job_id = resp.json()["job_id"]
+            job.ytdlp_job_id = meta_job_id
 
-        data = poll_service(
-            url         = f"{YTDLP_SERVICE_URL}/download/{meta_job_id}",
-            interval    = WHISPER_POLL_INTERVAL,
-            job         = job,
-            cancel_attr = "ytdlp_job_id",
-            log_running = "Fetching video metadata...",
-        )
-        if data is None:
-            return   # cancelled
+            data = poll_service(
+                url         = f"{YTDLP_SERVICE_URL}/download/{meta_job_id}",
+                interval    = WHISPER_POLL_INTERVAL,
+                job         = job,
+                cancel_attr = "ytdlp_job_id",
+                log_running = "Fetching video metadata...",
+            )
+            if data is None:
+                return   # cancelled
 
-        video_title   = data.get("title")   or "unknown_title"
-        video_channel = data.get("channel") or None
-        safe_title    = sanitize_title(video_title)
-
+            video_title   = data.get("title")   or "unknown_title"
+            video_channel = data.get("channel") or None
+            if data.get("title"):
+                save_meta(video_id, video_title, video_channel)
+        safe_title = sanitize_title(video_title)
+        
         job.log(f"Video ID : {video_id}")
         job.log(f"Title    : {video_title}")
         if video_channel:

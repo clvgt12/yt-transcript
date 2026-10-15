@@ -121,7 +121,7 @@ OLLAMA_TOOLS = [
 ]
 
 # ─── Web browser extension support ───────────────────────────────────────
-YT_WATCH_RE = re.compile(r"^https://www\.youtube\.com/watch\?v=[\w-]{11}$")
+YT_WATCH_RE = re.compile(r"^https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}$")
 
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     """
@@ -373,8 +373,9 @@ def poll_service(url: str, interval: int, job: "Job",
     """
     Generic polling loop for ytdlp-service and whisper-service.
     Polls GET {url} every {interval} seconds.
-    Returns response dict when status==done, None if cancelled/failed cleanly.
-    Raises RuntimeError on service failure.
+    Returns response dict when status==done, None if the job was cancelled
+    (by the client, or 404 from the service).
+    Raises RuntimeError on any other service failure, including timeouts.
     cancel_attr: name of job attribute holding the service job_id (for cancel detection)
     """
     while True:
@@ -396,8 +397,7 @@ def poll_service(url: str, interval: int, job: "Job",
             return data
         elif status == "failed":
             error = data.get("error", "")
-            if any(x in error.lower() for x in
-                   ("cancelled by client", "watchdog", "terminated")):
+            if "cancelled by client" in error.lower():
                 log.info("Service job stopped cleanly: %s", error)
                 setattr(job, cancel_attr, None)
                 return None
@@ -942,8 +942,8 @@ def run_workflow(job: Job):
     try:
         job.log("Resolving video metadata...")
         video_id = extract_video_id(job.url)
-        if not video_id:
-            raise RuntimeError("Could not extract video ID from URL.")
+        if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            raise RuntimeError("Could not extract a valid video ID from URL.")
 
         # ── Metadata: reuse the saved copy, otherwise ask ytdlp-service once ──
         saved = load_meta(video_id)

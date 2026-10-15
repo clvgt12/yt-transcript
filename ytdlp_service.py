@@ -165,36 +165,30 @@ class Job:
         self.process:    Optional[subprocess.Popen] = None
         self.watchdog:   Optional[JobWatchdog]      = None
 
-
 # ─── Job store — keyed by video_id for deduplication ─────────────────────────
 
 _jobs_by_id:       dict[str, Job] = {}   # job_id  → Job
 _jobs_by_video_id: dict[str, str] = {}   # video_id → job_id (active jobs only)
 _store_lock = threading.Lock()
 
-
 def get_job(job_id: str) -> Optional[Job]:
     with _store_lock:
         return _jobs_by_id.get(job_id)
-
 
 def get_active_job_for_video(video_id: str) -> Optional[Job]:
     with _store_lock:
         job_id = _jobs_by_video_id.get(video_id)
         return _jobs_by_id.get(job_id) if job_id else None
 
-
 def store_job(job: Job):
     with _store_lock:
         _jobs_by_id[job.job_id]           = job
         _jobs_by_video_id[job.video_id]   = job.job_id
 
-
 def release_video_id(video_id: str):
     """Remove video_id reservation so future requests start a new job."""
     with _store_lock:
         _jobs_by_video_id.pop(video_id, None)
-
 
 # ─── Kill / cleanup helper ────────────────────────────────────────────────────
 
@@ -227,7 +221,6 @@ def kill_job(job: Job, reason: str):
     _cleanup_media(job.video_id)
     release_video_id(job.video_id)
 
-
 def _cleanup_media(video_id: str):
     """
     Force-remove all media files for a video_id.
@@ -247,7 +240,6 @@ def _cleanup_media(video_id: str):
                 pass
     if removed:
         log.info("[%s] Force-cleaned media files: %s", video_id, ", ".join(removed))
-
 
 # ─── VTT → plain text converter ──────────────────────────────────────────────
 
@@ -326,7 +318,6 @@ def _run_cmd(job: Job, cmd: list) -> tuple[int, str, str]:
 def _info_path(video_id: str) -> Path:
     return INFO_DIR / f"{video_id}.info.json"
 
-
 def _read_cached_info(video_id: str) -> Optional[dict]:
     """Saved extraction if fresh and parseable, else None."""
     p = _info_path(video_id)
@@ -337,7 +328,6 @@ def _read_cached_info(video_id: str) -> Optional[dict]:
     except (OSError, ValueError):
         return None
 
-
 def _purge_old_info(max_age: int = 3600):
     cutoff = time.time() - max_age
     for f in INFO_DIR.glob("*.info.json"):
@@ -346,7 +336,6 @@ def _purge_old_info(max_age: int = 3600):
                 f.unlink()
         except OSError:
             pass
-
 
 def _extract_info(job: Job) -> Optional[dict]:
     """
@@ -390,7 +379,6 @@ def _extract_info(job: Job) -> Optional[dict]:
             "Deno is being installed — please retry after container rebuild."
         )
     raise RuntimeError(f"Metadata fetch failed: {_yt_error(stderr)}")
-
 
 def _pick_sub_lang(info: dict, *, auto: bool) -> Optional[str]:
     """First wanted language with a real (non-translated) track, else None."""
@@ -510,14 +498,24 @@ def download_worker(job: Job):
         # ── 4. Audio (mp3), from the saved extraction ─────────────────────────
         if job.audio:
             log.info("[%s] Downloading audio...", job.job_id[:8])
-            rc, _, stderr = _run_cmd(job, [
-                YT_DLP_BIN, "--load-info-json", str(info_path),
-                "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
-                "--output", str(out_dir / "%(title)s.%(ext)s"),
-            ])
+            audio_args = ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
+                          "--output", str(out_dir / "%(title)s.%(ext)s")]
+            rc, _, stderr = _run_cmd(job, [YT_DLP_BIN, "--load-info-json", str(info_path), *audio_args])
             if job.status == "failed":
                 return
+            if rc != 0 and "HTTP Error 403" in stderr:
+                # Saved stream URLs were rejected: drop them so no retry can reuse
+                # them, and make one direct attempt (fresh extraction + download).
+                log.warning("[%s] saved extraction rejected (403); retrying once directly",
+                            job.job_id[:8])
+                _info_path(video_id).unlink(missing_ok=True)
+                rc, _, stderr = _run_cmd(job, [YT_DLP_BIN, *audio_args, "--",
+                                               f"https://www.youtube.com/watch?v={video_id}"])
+                if job.status == "failed":
+                    return
             if rc != 0:
+                log.warning("[%s] audio download failed rc=%s; stderr tail: %s", job.job_id[:8], rc,
+                            " | ".join(stderr.splitlines()[-8:])[:1200])
                 raise RuntimeError(f"Audio download failed: {_yt_error(stderr)}")
             mp3s = list(out_dir.glob("*.mp3"))
             if not mp3s:

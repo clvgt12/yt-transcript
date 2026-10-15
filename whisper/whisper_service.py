@@ -281,12 +281,15 @@ def _transcribe_cuda(job: Job, audio_path: Path):
         f"--verbose False"
     )
 
-    job.process = subprocess.Popen(
+    proc = subprocess.Popen(
         cmd, shell=True, executable="/bin/bash",
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    stdout, stderr = job.process.communicate()
-    result_rc   = job.process.returncode
+    job.process = proc   # kill_job() may set job.process to None while we block below
+    if job.status == "failed":
+        proc.kill()      # cancelled while we were launching
+    stdout, stderr = proc.communicate()
+    result_rc   = proc.returncode
     job.process = None
 
     # Check if killed by watchdog while communicate() was blocking

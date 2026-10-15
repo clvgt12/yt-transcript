@@ -310,13 +310,18 @@ def _run_cmd(job: Job, cmd: list) -> tuple[int, str, str]:
     # Inject the PO Token provider URL into every yt-dlp invocation.
     if cmd and cmd[0] == YT_DLP_BIN:
         cmd = [cmd[0], *POT_ARGS, *cmd[1:]]
-    job.process = subprocess.Popen(
+    if job.status == "failed":
+        # Cancelled between steps: don't start work nobody is waiting for.
+        return -1, "", "cancelled"
+    proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    stdout, stderr = job.process.communicate()
-    rc = job.process.returncode
+    job.process = proc   # cancel/watchdog may set job.process to None at any time
+    if job.status == "failed":
+        proc.kill()      # cancelled while we were launching
+    stdout, stderr = proc.communicate()
     job.process = None
-    return rc, stdout.strip(), stderr.strip()
+    return proc.returncode, stdout.strip(), stderr.strip()
 
 def _info_path(video_id: str) -> Path:
     return INFO_DIR / f"{video_id}.info.json"

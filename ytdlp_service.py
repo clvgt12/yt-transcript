@@ -376,6 +376,9 @@ def _extract_info(job: Job) -> Optional[dict]:
             return info
         except (OSError, ValueError):
             pass
+    log.warning("[%s] extraction failed rc=%s file_written=%s; stderr tail: %s",
+                job.job_id[:8], rc, p.exists(),
+                " | ".join(stderr.splitlines()[-8:])[:1200])
     if js_warning:
         raise RuntimeError(
             "YouTube requires a JavaScript runtime for this video. "
@@ -445,7 +448,8 @@ def _yt_error(stderr: str, limit: int = 400) -> str:
     errs = [l for l in lines if l.startswith("ERROR")]
     text = " | ".join(errs) if errs else " | ".join(lines[-3:])
     if "not a bot" in text:
-        text = "YouTube bot check (PO token or cookies needed): " + text
+        return ("YouTube bot check (often transient; wait a few minutes before "
+                "retrying). Full details are in the ytdlp-service log.")
     return text[:limit]
 
 def download_worker(job: Job):

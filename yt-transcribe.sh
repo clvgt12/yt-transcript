@@ -14,6 +14,8 @@
 #   ./yt-transcribe.sh build [args...]    # build; extra args passed through
 #                                         #   e.g. ./yt-transcribe.sh build --no-cache
 #   ./yt-transcribe.sh clean              # docker system prune -f (see warning below)
+#   ./yt-transcribe.sh realclean          # stop, purge web cache (transcripts,
+#                                         #   summaries, chat histories), then clean
 #   ./yt-transcribe.sh package {firefox|firefox-dev|chromium|all|dev}
 #                                         # sign/pack the browser extension for
 #                                         # manual install — see below
@@ -70,6 +72,8 @@ EXT_DEPLOY_DIR="${YT_TRANSCRIBE_HOME}/extensions"
 EXT_DIST_DIR="${EXT_DEPLOY_DIR}/dist"
 EXT_KEYS_DIR="${EXT_DEPLOY_DIR}/keys"
 CHROMIUM_KEY="${EXT_KEYS_DIR}/yt-transcribe.pem"
+
+WEB_FILES_DIR="${YT_TRANSCRIBE_HOME}/web/files"                      # web app cache, purged by clean/realclean
 
 # Load environment files: secrets first (highest priority), then defaults
 [ -f "${SCRIPT_DIR}/.env.secrets" ] && source "${SCRIPT_DIR}/.env.secrets"
@@ -321,6 +325,25 @@ cmd_build() {
     run_compose build "$@"
 }
 
+purge_web_cache() {
+    [ -n "${WEB_FILES_DIR}" ] && [ "${WEB_FILES_DIR}" != "/" ] \
+        || die "Refusing to purge: WEB_FILES_DIR is empty or unsafe ('${WEB_FILES_DIR}')"
+
+    if [ ! -d "${WEB_FILES_DIR}" ]; then
+        log "Web cache not found at ${WEB_FILES_DIR} — nothing to purge."
+        return 0
+    fi
+
+    log "Purging web cache (including hidden files): ${WEB_FILES_DIR}/*"
+    # Top-level entries only, hidden ones included. find avoids the . and ..
+    # ambiguity of dotglob. Root-owned leftovers from the container are rare;
+    # if one blocks removal, the hint points at the manual fix.
+    if ! find "${WEB_FILES_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; then
+        die "Could not remove everything under ${WEB_FILES_DIR} — a root-owned file is the likely cause. Fix with: sudo rm -rf ${WEB_FILES_DIR}/* ${WEB_FILES_DIR}/.[!.]*"
+    fi
+    log "Web cache purged."
+}
+
 cmd_clean() {
     log "WARNING: 'docker system prune -f' removes ALL stopped containers,"
     log "         dangling images, and unused networks/build cache on this"
@@ -333,6 +356,9 @@ cmd_clean() {
 
 cmd_realclean() {
     cmd_stop
+    log "WARNING: realclean also deletes ALL cached transcripts, summaries,"
+    log "         and chat histories under ${WEB_FILES_DIR}."
+    purge_web_cache
     cmd_clean
 }
 
@@ -380,7 +406,8 @@ Usage: $(basename "$0") {start|stop|restart|build [args...]|clean|realclean|pack
   restart             stop, then start
   build [args...]     Build images; extra args passed through (e.g. --no-cache)
   clean               docker system prune -f (host-wide — see warning)
-  realclean           stop, then clean
+  realclean           stop, purge the web cache (${WEB_FILES_DIR}/*, including
+                        chat histories), then clean
   package TARGET      Sign/pack the browser extension for manual install:
                         firefox     — AMO-signed .xpi (needs AMO_JWT_ISSUER/SECRET;
                                        fails with a Conflict if this version was
